@@ -247,6 +247,10 @@ def check_pullback(symbol: str, state: dict) -> tuple[list[dict], dict]:
     # Default True: coin was above EMA50 when added by screener
     was_above_50  = state.get("above_ema50",  True)
 
+    vol_ratio = round(vol / vol_ma, 2) if vol_ma else 0
+    ema50_dist = round((close - ema50) / ema50 * 100, 2)
+    print(f"    {symbol} | close={close:.6g} low={low:.6g} EMA50={ema50:.6g} dist={ema50_dist:+.2f}% vol={vol_ratio}×avg was_above={was_above_50} good_vol={good_volume}")
+
     alerts = []
 
     # EMA50 pullback: was above, now candle touches EMA50
