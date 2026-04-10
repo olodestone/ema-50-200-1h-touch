@@ -7,7 +7,7 @@ import time
 import pandas as pd
 
 AUTO_VOLUME_MULT  = 1.5    # volume must be > vol_ma × this for screener entry
-SCREENER_TOP_N    = 200    # only check top N pairs by 24h quote volume
+SCREENER_TOP_N    = 100    # only check top N pairs by 24h quote volume
 MIN_EMA50_MARGIN  = 0.005  # close must be at least 0.5% above EMA50 to qualify
 
 # Stablecoins and pegged assets — excluded from screener (price always hugs EMA)
