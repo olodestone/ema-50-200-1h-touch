@@ -252,10 +252,11 @@ def check_pullback(symbol: str, state: dict) -> tuple[list[dict], dict]:
                 "alert_type": "breakdown",
             })
 
+    # Cast to plain Python bool — numpy.bool_ is not JSON-serialisable
     new_state = {
-        "above_ema50":  now_above_50,
-        "above_ema200": now_above_200,
-        "auto_remove":  close < ema200 * AUTO_REMOVE_THRESH,
+        "above_ema50":  bool(now_above_50),
+        "above_ema200": bool(now_above_200),
+        "auto_remove":  bool(close < ema200 * AUTO_REMOVE_THRESH),
     }
     return alerts, new_state
 

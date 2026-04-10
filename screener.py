@@ -9,6 +9,10 @@ import pandas as pd
 AUTO_VOLUME_MULT = 1.5   # volume must be > vol_ma × this for screener entry
 SCREENER_TOP_N   = 100   # only check top N pairs by 24h quote volume
 
+# Stablecoins and pegged assets — excluded from screener (price always hugs EMA)
+EXCLUDED = {"USDC/USDT", "USDT/USDC", "TUSD/USDT", "BUSD/USDT", "DAI/USDT",
+            "FDUSD/USDT", "PYUSD/USDT", "USDP/USDT", "PAXG/USDT", "XAUT/USDT"}
+
 
 def scan_trending_coins(exchange, top_n: int = SCREENER_TOP_N) -> list[str]:
     """
@@ -26,10 +30,12 @@ def scan_trending_coins(exchange, top_n: int = SCREENER_TOP_N) -> list[str]:
         print(f"  Screener: fetch_tickers error: {e}")
         return []
 
-    # Filter to USDT spot pairs, sort by 24h quote volume descending
+    # Filter to USDT spot pairs, exclude stablecoins/pegged assets
     usdt_pairs = []
     for sym, ticker in tickers.items():
         if not sym.endswith("/USDT"):
+            continue
+        if sym in EXCLUDED:
             continue
         market = exchange.markets.get(sym, {})
         if market.get("type") not in (None, "spot"):
