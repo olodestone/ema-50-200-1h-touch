@@ -118,9 +118,16 @@ def normalise_symbol(raw: str) -> str | None:
     Returns ccxt-format "BTC/USDT" or None if unrecognisable.
     """
     s = raw.upper().strip()
+    # Strip perpetual/futures suffixes from charting tools (e.g. BTCUSDT.P, BTC.P)
+    for suffix in (".P", "-PERP", "_PERP", ".PERP"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+            break
     if "/" in s:
         base, quote = s.split("/", 1)
-        return f"{base}/{quote}"
+        if base and quote:          # guard against "/AVNT" → base="", quote="AVNT"
+            return f"{base}/{quote}"
+        s = base or quote           # strip the stray slash and continue
     if "-" in s:
         base, quote = s.split("-", 1)
         return f"{base}/{quote}"
