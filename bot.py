@@ -20,6 +20,7 @@ from screener import scan_trending_coins
 WATCHLIST_FILE      = "watchlist.json"
 AUTO_WATCHLIST_FILE = "auto_watchlist.json"
 PRICE_STATE_FILE    = "price_state.json"
+ALERT_STATE_FILE    = "alert_state.json"
 
 CHECK_INTERVAL     = 300           # seconds between candle checks (5 min)
 AUTO_SCAN_INTERVAL = 3600          # seconds between screener scans (1 hour)
@@ -39,8 +40,9 @@ exchange = ccxt.kucoin({
     "enableRateLimit": True,
 })
 
-# ─── In-memory alert state ───────────────────────────────────────────────────
-# key: (symbol, label)  value: datetime of last alert
+# ─── Alert cooldown state (persisted) ───────────────────────────────────────
+# key: "SYMBOL|label"  value: datetime of last alert sent
+# Persisted so restarts don't re-fire alerts within the 4h cooldown window.
 last_alert: dict = {}
 
 # ─── Persistence ─────────────────────────────────────────────────────────────
@@ -89,6 +91,24 @@ def load_price_state() -> dict:
 def save_price_state(state: dict):
     with open(PRICE_STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
+
+
+def load_alert_state() -> dict:
+    """Load last_alert from disk. Keys are 'SYMBOL|label', values are datetime."""
+    if not os.path.exists(ALERT_STATE_FILE):
+        return {}
+    try:
+        with open(ALERT_STATE_FILE) as f:
+            raw = json.load(f)
+        return {k: datetime.fromisoformat(v) for k, v in raw.items()}
+    except Exception:
+        return {}
+
+
+def save_alert_state(state: dict):
+    """Persist last_alert to disk. Converts datetime values to ISO strings."""
+    with open(ALERT_STATE_FILE, "w") as f:
+        json.dump({k: v.isoformat() for k, v in state.items()}, f, indent=2)
 
 
 # ─── Symbol normalisation ────────────────────────────────────────────────────
@@ -438,6 +458,7 @@ def run():
     watchlist      = load_watchlist()
     auto_watchlist = load_auto_watchlist()
     price_state    = load_price_state()
+    last_alert.update(load_alert_state())
 
     if watchlist:
         send_telegram(f"Resumed manual watchlist: {', '.join(watchlist)}")
@@ -491,11 +512,12 @@ def run():
                     try:
                         alerts = check_touch(symbol)
                         for alert in alerts:
-                            key  = (symbol, alert["ema_label"])
+                            key  = f"{symbol}|{alert['ema_label']}"
                             prev = last_alert.get(key)
                             if prev is None or (datetime.utcnow() - prev) >= ALERT_COOLDOWN:
                                 send_alert(alert)
                                 last_alert[key] = datetime.utcnow()
+                                save_alert_state(last_alert)
                             else:
                                 remaining = ALERT_COOLDOWN - (datetime.utcnow() - prev)
                                 print(f"  {symbol} {alert['ema_label']} — cooldown ({int(remaining.total_seconds()/60)}m left)")
@@ -516,12 +538,13 @@ def run():
                         price_state[symbol] = new_state
 
                         for alert in alerts:
-                            # Use "_auto" suffix so cooldown is independent of manual watchlist
-                            key  = (symbol, alert["ema_label"] + "_auto")
+                            # "_auto" suffix keeps cooldown independent from manual watchlist
+                            key  = f"{symbol}|{alert['ema_label']}_auto"
                             prev = last_alert.get(key)
                             if prev is None or (datetime.utcnow() - prev) >= ALERT_COOLDOWN:
                                 send_alert(alert)
                                 last_alert[key] = datetime.utcnow()
+                                save_alert_state(last_alert)
                             else:
                                 remaining = ALERT_COOLDOWN - (datetime.utcnow() - prev)
                                 print(f"  {symbol} {alert['ema_label']} auto — cooldown ({int(remaining.total_seconds()/60)}m left)")
