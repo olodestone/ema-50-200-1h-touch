@@ -525,7 +525,7 @@ def run():
                             print(f"  {symbol} — no touch")
                     except Exception as e:
                         print(f"  {symbol} check error: {e}")
-                    time.sleep(0.5)
+                    time.sleep(1.0)
 
             # Auto-watchlist — pullback / breakdown alerts only
             if auto_watchlist:
@@ -556,7 +556,7 @@ def run():
                             print(f"  {symbol} — no pullback")
                     except Exception as e:
                         print(f"  {symbol} auto-check error: {e}")
-                    time.sleep(0.5)
+                    time.sleep(1.0)
 
                 if to_remove:
                     for s in to_remove:

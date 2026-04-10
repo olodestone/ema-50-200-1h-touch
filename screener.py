@@ -7,7 +7,7 @@ import time
 import pandas as pd
 
 AUTO_VOLUME_MULT  = 1.5    # volume must be > vol_ma × this for screener entry
-SCREENER_TOP_N    = 100    # only check top N pairs by 24h quote volume
+SCREENER_TOP_N    = 200    # only check top N pairs by 24h quote volume
 MIN_EMA50_MARGIN  = 0.005  # close must be at least 0.5% above EMA50 to qualify
 
 # Stablecoins and pegged assets — excluded from screener (price always hugs EMA)
@@ -74,7 +74,7 @@ def scan_trending_coins(exchange, top_n: int = SCREENER_TOP_N) -> list[str]:
                 pct = (close - ema50) / ema50 * 100
                 print(f"    ✓ {sym} — trending (close {close:.6g} > EMA50 {ema50:.6g}, +{pct:.2f}%)")
 
-            time.sleep(0.3)  # gentle rate limiting between requests
+            time.sleep(0.5)  # rate limiting — 0.3s was hitting KuCoin 429s
         except Exception as e:
             print(f"  Screener {sym}: {e}")
             continue
