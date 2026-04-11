@@ -442,19 +442,35 @@ def run_screener(auto_watchlist: list, price_state: dict):
     print(f"[{datetime.utcnow().strftime('%H:%M')}] Running auto-screener...")
     try:
         found     = scan_trending_coins(exchange)
-        new_coins = [s for s in found if s not in auto_watchlist]
-        for s in new_coins:
+        new_items = [c for c in found if c["symbol"] not in auto_watchlist]
+        for item in new_items:
+            s = item["symbol"]
             auto_watchlist.append(s)
             if s not in price_state:
                 # Coin is above EMA50 by screener definition
                 price_state[s] = {"above_ema50": True, "above_ema200": True}
 
-        if new_coins:
+        if new_items:
             save_auto_watchlist(auto_watchlist)
             save_price_state(price_state)
+
+            def _fmt_entry(item):
+                sym   = item["symbol"]
+                c     = item["close"]
+                e50   = item["ema50"]
+                e200  = item["ema200"]
+                pct   = item["pct"]
+                vr    = item["vol_ratio"]
+                prec  = max(len(f"{c:.8f}".rstrip("0").split(".")[-1]), 2)
+                fmt   = f"{{:.{prec}f}}"
+                return (f"• {sym}\n"
+                        f"  Price {fmt.format(c)}  EMA50 {fmt.format(e50)}"
+                        f"  EMA200 {fmt.format(e200)}"
+                        f"  (+{pct:.1f}%)  vol {vr}×avg")
+
             send_telegram(
-                f"🔍 Screener found {len(new_coins)} new trending coin(s):\n"
-                + "\n".join(f"• {s}" for s in sorted(new_coins))
+                f"🔍 Screener found {len(new_items)} new trending coin(s):\n"
+                + "\n".join(_fmt_entry(item) for item in sorted(new_items, key=lambda x: x["symbol"]))
                 + f"\nAuto-list total: {len(auto_watchlist)}"
             )
         else:

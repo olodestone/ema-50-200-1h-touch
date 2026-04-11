@@ -29,6 +29,7 @@ User adds coins via Telegram. Alerts on **any** EMA50 or EMA200 touch (from abov
 ### Auto-screener
 Runs every hour. Scans top 100 KuCoin USDT pairs by 24h volume. Adds coins where:
 - 1h close > EMA50 (price is in uptrend)
+- 1h EMA50 > EMA200 (bullish macro alignment — faster average above slower)
 - 1h volume > vol_ma × 1.5 (volume-confirmed move)
 
 Monitors auto-added coins for **pullbacks only**:
