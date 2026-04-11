@@ -125,11 +125,13 @@ Both modes inspect **`df.iloc[-2]`** — the last *closed* 1h candle. `df.iloc[-
 # candle = df.iloc[-2]  (last closed)
 candle_touched = low <= ema_val <= high          # wick or body passed through the level
 close_near     = abs(close - ema_val) / ema_val <= 0.001   # closed within 0.1% of EMA
-good_volume    = volume > vol_ma * 1.3
+good_volume    = volume > vol_ma * 1.3         # manual watchlist (VOLUME_MULT)
+good_vol_auto  = volume > vol_ma * 0.3         # auto-screener pullbacks (PULLBACK_VOLUME_MULT)
 
 # Manual: fires if (candle_touched OR close_near) AND good_volume
 
 # Auto — EMA50 pullback: additionally requires was_above_ema50 = True (from price_state.json)
+#         uses good_vol_auto (0.3×) not good_volume — pullbacks naturally have lower volume
 # Auto — EMA200 breakdown: requires was_above_ema50 AND now close < EMA50
 ```
 
@@ -148,7 +150,8 @@ A 1h candle closes once per hour. The 5-min check loop detects the close within 
 | `CHECK_INTERVAL` | 300s (5 min) | How often to check each pair |
 | `AUTO_SCAN_INTERVAL` | 3600s (1 hour) | How often screener runs |
 | `ALERT_COOLDOWN` | 4 hours | Per (symbol, EMA) pair |
-| `VOLUME_MULT` | 1.3× | Volume gate for touch alerts |
+| `VOLUME_MULT` | 1.3× | Volume gate for manual-watchlist touch alerts |
+| `PULLBACK_VOLUME_MULT` | 0.3× | Volume gate for auto-screener pullback alerts (lower — pullbacks have less volume than the breakout that qualified entry) |
 | `AUTO_VOLUME_MULT` | 1.5× | Volume gate for screener entry (stricter) |
 | `TOUCH_BUFFER` | 0.1% | Close-to-EMA proximity threshold |
 | `AUTO_REMOVE_THRESH` | 0.97 | Remove from auto-list if close < EMA200 × 0.97 |
@@ -202,8 +205,12 @@ This bot's job is pure notification, not signal generation. The user decides whe
 **Why direction-aware pullback detection (auto-screener) vs any-touch (manual)?**
 The screener's entire premise is "coin was trending up → now pulling back to support." Alerting on a touch from below (price bouncing off EMA50 after being below it) would be noise — that's not the setup. Storing `price_state.json` per symbol lets the bot know which direction the price came from.
 
-**Why 1.5× volume for screener entry vs 1.3× for alerts?**
-The screener entry bar is stricter to reduce noise — only genuinely volume-confirmed trending moves get auto-added. The alert threshold stays at 1.3× so pullback touches with slightly lower volume still fire (a pullback naturally has less volume than the initial breakout).
+**Why 1.5× volume for screener entry, 1.3× for manual alerts, and 0.5× for auto-screener pullback alerts?**
+Screener entry (1.5×): only genuinely volume-confirmed trending moves get auto-added — strict to avoid filling the list with noise.
+
+Manual alerts (1.3×): any-touch mode needs a volume confirmation that something meaningful is happening.
+
+Auto-screener pullbacks (0.3×): a pullback to EMA50 by definition has *less* volume than the breakout that qualified it — that's what a pullback looks like. During consolidation, volume dries up as the breakout momentum fades and price drifts back to support. Using 1.3× here would block nearly every valid pullback setup. 0.5× filters completely dead/illiquid candles (where a handful of trades produce a meaningless wick) while letting all real pullbacks through.
 
 **Why auto-remove at 3% below EMA200?**
 If a coin crashes through both EMAs it's no longer a pullback setup — it's in freefall. Keeping it on the auto-list would generate breakdown alerts indefinitely. 3% gives a small buffer for wicks below EMA200 that recover, without holding dead setups forever.

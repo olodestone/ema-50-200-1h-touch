@@ -22,12 +22,17 @@ AUTO_WATCHLIST_FILE = "auto_watchlist.json"
 PRICE_STATE_FILE    = "price_state.json"
 ALERT_STATE_FILE    = "alert_state.json"
 
-CHECK_INTERVAL     = 300           # seconds between candle checks (5 min)
-AUTO_SCAN_INTERVAL = 3600          # seconds between screener scans (1 hour)
-ALERT_COOLDOWN     = timedelta(hours=4)
-VOLUME_MULT        = 1.3           # volume gate for manual-watchlist touch alerts
-TOUCH_BUFFER       = 0.001         # 0.1% — close within this of EMA counts as touch
-AUTO_REMOVE_THRESH = 0.97          # auto-remove if close < EMA200 × this (3% below)
+CHECK_INTERVAL        = 300           # seconds between candle checks (5 min)
+AUTO_SCAN_INTERVAL    = 3600          # seconds between screener scans (1 hour)
+ALERT_COOLDOWN        = timedelta(hours=4)
+VOLUME_MULT           = 1.3           # volume gate for manual-watchlist touch alerts
+PULLBACK_VOLUME_MULT  = 0.3           # volume gate for auto-screener pullback alerts
+                                      # (pullbacks naturally have lower volume than
+                                      #  the breakout that qualified the coin for the
+                                      #  screener — 0.3× filters dead/illiquid candles
+                                      #  without blocking normal consolidation touches)
+TOUCH_BUFFER          = 0.001         # 0.1% — close within this of EMA counts as touch
+AUTO_REMOVE_THRESH    = 0.97          # auto-remove if close < EMA200 × this (3% below)
 
 TOKEN   = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -240,7 +245,7 @@ def check_pullback(symbol: str, state: dict) -> tuple[list[dict], dict]:
     if pd.isna(vol_ma) or vol_ma == 0 or pd.isna(ema50) or pd.isna(ema200):
         return [], state
 
-    good_volume   = vol > vol_ma * VOLUME_MULT
+    good_volume   = vol > vol_ma * PULLBACK_VOLUME_MULT
     now_above_50  = close > ema50
     now_above_200 = close > ema200
 
