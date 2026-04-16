@@ -36,7 +36,8 @@ FRESH_CROSS_TOUCH_BUFFER = 0.005      # 0.5% — wider buffer for fresh golden c
                                       # (EMA50/200 are close together post-cross; price
                                       #  may dip slightly below EMA50 before bouncing)
 AUTO_REMOVE_THRESH    = 0.97          # auto-remove if close < EMA200 × this (3% below)
-FRESH_CROSS_WINDOW    = 72            # hours — pullback alert shows "fresh cross" tag
+FRESH_CROSS_WINDOW    = 72            # hours — ⭐ tag, wider touch buffer, "fresh cross" label
+CROSS_INFO_WINDOW     = 336           # hours (14 days) — informational 📌 note on alerts
 
 TOKEN   = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -344,13 +345,19 @@ def send_alert(alert: dict):
     is_fresh  = alert.get("is_fresh_cross", False)
     cross_ts  = alert.get("cross_ts")
     cross_line = ""
-    if is_fresh and cross_ts:
+    if cross_ts:
         try:
-            cross_dt   = datetime.fromisoformat(cross_ts).replace(tzinfo=None)
-            hours_ago  = int((datetime.utcnow() - cross_dt).total_seconds() / 3600)
-            cross_line = f"\n🌟 Fresh golden cross ({hours_ago}h ago)"
+            cross_dt  = datetime.fromisoformat(cross_ts).replace(tzinfo=None)
+            hours_ago = (datetime.utcnow() - cross_dt).total_seconds() / 3600
+            if is_fresh:
+                # < 72h: fresh cross — show hours
+                cross_line = f"\n🌟 Fresh golden cross ({int(hours_ago)}h ago)"
+            elif hours_ago < CROSS_INFO_WINDOW:
+                # 72h–336h: older cross — show days, informational only
+                days_ago   = int(hours_ago / 24)
+                cross_line = f"\n📌 Golden cross {days_ago}d ago"
         except Exception:
-            cross_line = "\n🌟 Fresh golden cross"
+            pass
 
     if kind == "pullback":
         header    = f"{'⭐' if is_fresh else '🔄'} EMA50 PULLBACK — {symbol}"
@@ -512,10 +519,24 @@ def run_screener(auto_watchlist: list, price_state: dict):
                 vr    = item["vol_ratio"]
                 prec  = max(len(f"{c:.8f}".rstrip("0").split(".")[-1]), 2)
                 fmt   = f"{{:.{prec}f}}"
+                # Show cross note when a golden cross was found within 14 days
+                # but older than 72h (72h+ gets the ⭐ fresh-cross treatment instead)
+                cross_note = ""
+                cross_ts = item.get("cross_ts")
+                if cross_ts:
+                    try:
+                        cross_dt  = datetime.fromisoformat(cross_ts).replace(tzinfo=None)
+                        hours_ago = (datetime.utcnow() - cross_dt).total_seconds() / 3600
+                        if hours_ago >= FRESH_CROSS_WINDOW:
+                            days_ago = int(hours_ago / 24)
+                            cross_note = f"\n  📌 Golden cross {days_ago}d ago"
+                    except Exception:
+                        pass
                 return (f"• {sym}\n"
                         f"  Price {fmt.format(c)}  EMA50 {fmt.format(e50)}"
                         f"  EMA200 {fmt.format(e200)}"
-                        f"  (+{pct:.1f}%)  vol {vr}×avg")
+                        f"  (+{pct:.1f}%)  vol {vr}×avg"
+                        f"{cross_note}")
 
             def _fmt_cross_entry(item):
                 sym     = item["symbol"]

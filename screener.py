@@ -12,7 +12,9 @@ AUTO_VOLUME_MULT       = 1.5   # volume must be > vol_ma × this for screener en
 SCREENER_TOP_N         = 100   # only check top N pairs by 24h quote volume
 MIN_EMA50_MARGIN       = 0.005 # close must be at least 0.5% above EMA50 to qualify
 GOLDEN_CROSS_LOOKBACK  = 3     # candles back for Path B (immediate cross detection)
-FRESH_CROSS_WINDOW_H   = 72    # hours — Path A also checks this far back for a recent cross
+FRESH_CROSS_WINDOW_H   = 72    # hours — controls ⭐ tag + wider buffer in bot.py
+CROSS_INFO_WINDOW_H    = 336   # hours (14 days) — Path A looks this far back for a cross
+                                # to include as an informational note; no effect on alert behaviour
 
 # Stablecoins and pegged assets — excluded from screener (price always hugs EMA)
 EXCLUDED = {"USDC/USDT", "USDT/USDC", "TUSD/USDT", "BUSD/USDT", "DAI/USDT",
@@ -93,7 +95,7 @@ def scan_trending_coins(exchange, top_n: int = SCREENER_TOP_N) -> list[dict]:
     trending = []
     for sym in candidates:
         try:
-            raw = exchange.fetch_ohlcv(sym, "1h", limit=220)
+            raw = exchange.fetch_ohlcv(sym, "1h", limit=336)  # 336 = 14 days; EMA200 needs 200
             if len(raw) < 60:
                 continue
 
@@ -120,10 +122,11 @@ def scan_trending_coins(exchange, top_n: int = SCREENER_TOP_N) -> list[dict]:
             bullish_macro = ema50 > ema200
 
             # Path A — momentum: trending with volume confirmation
-            # Also scan back FRESH_CROSS_WINDOW_H candles for a recent golden cross
-            # so that coins added a day after the cross still carry cross_ts.
+            # Scan back CROSS_INFO_WINDOW_H (14 days) for a recent golden cross.
+            # cross_ts is informational only — shown in entry/pullback alerts but
+            # does not change whether alerts fire or what thresholds apply.
             if above_margin and bullish_macro and vol > vol_ma * AUTO_VOLUME_MULT:
-                _, cross_ts = detect_golden_cross(df, lookback=FRESH_CROSS_WINDOW_H)
+                _, cross_ts = detect_golden_cross(df, lookback=CROSS_INFO_WINDOW_H)
                 trending.append({"symbol": sym, "close": close, "ema50": ema50,
                                  "ema200": ema200, "pct": pct, "vol_ratio": vol_ratio,
                                  "entry_reason": "momentum", "cross_ts": cross_ts})
