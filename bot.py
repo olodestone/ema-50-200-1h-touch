@@ -31,8 +31,12 @@ PULLBACK_VOLUME_MULT  = 0.3           # volume gate for auto-screener pullback a
                                       #  the breakout that qualified the coin for the
                                       #  screener — 0.3× filters dead/illiquid candles
                                       #  without blocking normal consolidation touches)
-TOUCH_BUFFER          = 0.001         # 0.1% — close within this of EMA counts as touch
+TOUCH_BUFFER             = 0.001      # 0.1% — close within this of EMA counts as touch
+FRESH_CROSS_TOUCH_BUFFER = 0.005      # 0.5% — wider buffer for fresh golden cross coins
+                                      # (EMA50/200 are close together post-cross; price
+                                      #  may dip slightly below EMA50 before bouncing)
 AUTO_REMOVE_THRESH    = 0.97          # auto-remove if close < EMA200 × this (3% below)
+FRESH_CROSS_WINDOW    = 72            # hours — pullback alert shows "fresh cross" tag
 
 TOKEN   = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -252,25 +256,41 @@ def check_pullback(symbol: str, state: dict) -> tuple[list[dict], dict]:
     # Default True: coin was above EMA50 when added by screener
     was_above_50  = state.get("above_ema50",  True)
 
+    # Fresh golden cross context — passed through to the alert
+    cross_ts_str  = state.get("cross_ts")
+    is_fresh_cross = False
+    if cross_ts_str:
+        try:
+            cross_dt = datetime.fromisoformat(cross_ts_str).replace(tzinfo=None)
+            is_fresh_cross = (datetime.utcnow() - cross_dt).total_seconds() < FRESH_CROSS_WINDOW * 3600
+        except Exception:
+            pass
+
+    # Wider touch buffer right after a golden cross — EMA50/200 are close together
+    # and price may dip slightly below EMA50 before bouncing
+    touch_buf = FRESH_CROSS_TOUCH_BUFFER if is_fresh_cross else TOUCH_BUFFER
+
     vol_ratio = round(vol / vol_ma, 2) if vol_ma else 0
     ema50_dist = round((close - ema50) / ema50 * 100, 2)
-    print(f"    {symbol} | close={close:.6g} low={low:.6g} EMA50={ema50:.6g} dist={ema50_dist:+.2f}% vol={vol_ratio}×avg was_above={was_above_50} good_vol={good_volume}")
+    print(f"    {symbol} | close={close:.6g} low={low:.6g} EMA50={ema50:.6g} dist={ema50_dist:+.2f}% vol={vol_ratio}×avg was_above={was_above_50} good_vol={good_volume} fresh_cross={is_fresh_cross}")
 
     alerts = []
 
     # EMA50 pullback: was above, now candle touches EMA50
     if was_above_50:
         candle_touched = low <= ema50 <= high
-        close_near     = abs(close - ema50) / ema50 <= TOUCH_BUFFER
+        close_near     = abs(close - ema50) / ema50 <= touch_buf
         if (candle_touched or close_near) and good_volume:
             alerts.append({
-                "symbol":     symbol,
-                "ema_label":  "EMA50",
-                "ema_value":  round(ema50, 6),
-                "close":      round(close, 6),
-                "volume":     round(vol, 2),
-                "vol_ma":     round(vol_ma, 2),
-                "alert_type": "pullback",
+                "symbol":        symbol,
+                "ema_label":     "EMA50",
+                "ema_value":     round(ema50, 6),
+                "close":         round(close, 6),
+                "volume":        round(vol, 2),
+                "vol_ma":        round(vol_ma, 2),
+                "alert_type":    "pullback",
+                "is_fresh_cross": is_fresh_cross,
+                "cross_ts":      cross_ts_str,
             })
 
     # EMA200 breakdown touch: was above EMA50, now below EMA50, touching EMA200
@@ -279,21 +299,27 @@ def check_pullback(symbol: str, state: dict) -> tuple[list[dict], dict]:
         close_near     = abs(close - ema200) / ema200 <= TOUCH_BUFFER
         if (candle_touched or close_near) and good_volume:
             alerts.append({
-                "symbol":     symbol,
-                "ema_label":  "EMA200",
-                "ema_value":  round(ema200, 6),
-                "close":      round(close, 6),
-                "volume":     round(vol, 2),
-                "vol_ma":     round(vol_ma, 2),
-                "alert_type": "breakdown",
+                "symbol":        symbol,
+                "ema_label":     "EMA200",
+                "ema_value":     round(ema200, 6),
+                "close":         round(close, 6),
+                "volume":        round(vol, 2),
+                "vol_ma":        round(vol_ma, 2),
+                "alert_type":    "breakdown",
+                "is_fresh_cross": is_fresh_cross,
+                "cross_ts":      cross_ts_str,
             })
 
     # Cast to plain Python bool — numpy.bool_ is not JSON-serialisable
+    # Preserve cross_ts / entry_reason so fresh-cross tracking survives restarts
     new_state = {
         "above_ema50":  bool(now_above_50),
         "above_ema200": bool(now_above_200),
         "auto_remove":  bool(close < ema200 * AUTO_REMOVE_THRESH),
     }
+    if cross_ts_str:
+        new_state["cross_ts"]     = cross_ts_str
+        new_state["entry_reason"] = state.get("entry_reason", "golden_cross")
     return alerts, new_state
 
 
@@ -315,14 +341,25 @@ def send_alert(alert: dict):
     vol_ratio = round(volume / vol_ma, 2) if vol_ma else 0
     kind      = alert.get("alert_type", "touch")
 
+    is_fresh  = alert.get("is_fresh_cross", False)
+    cross_ts  = alert.get("cross_ts")
+    cross_line = ""
+    if is_fresh and cross_ts:
+        try:
+            cross_dt   = datetime.fromisoformat(cross_ts).replace(tzinfo=None)
+            hours_ago  = int((datetime.utcnow() - cross_dt).total_seconds() / 3600)
+            cross_line = f"\n🌟 Fresh golden cross ({hours_ago}h ago)"
+        except Exception:
+            cross_line = "\n🌟 Fresh golden cross"
+
     if kind == "pullback":
-        header    = f"🔄 EMA50 PULLBACK — {symbol}"
+        header    = f"{'⭐' if is_fresh else '🔄'} EMA50 PULLBACK — {symbol}"
         direction = "pulling back from above"
-        footer    = "\n[auto-screener]"
+        footer    = f"{cross_line}\n[auto-screener]"
     elif kind == "breakdown":
         header    = f"⚠️ EMA200 BREAKDOWN TOUCH — {symbol}"
         direction = "broke below EMA50 → testing EMA200"
-        footer    = "\n[auto-screener]"
+        footer    = f"{cross_line}\n[auto-screener]"
     else:
         direction = "touching from above" if close >= ema_val else "touching from below"
         header    = f"📍 {label} TOUCH — {symbol}"
@@ -447,12 +484,24 @@ def run_screener(auto_watchlist: list, price_state: dict):
             s = item["symbol"]
             auto_watchlist.append(s)
             if s not in price_state:
-                # Coin is above EMA50 by screener definition
-                price_state[s] = {"above_ema50": True, "above_ema200": True}
+                state_entry = {"above_ema50": True, "above_ema200": True}
+                # Store cross_ts for any coin that had a recent golden cross —
+                # both Path B (direct cross detection) and Path A (momentum coin
+                # where the cross happened up to FRESH_CROSS_WINDOW_H hours ago).
+                # cross_ts is already an ISO string from detect_golden_cross().
+                cross_ts = item.get("cross_ts")
+                if cross_ts is not None:
+                    state_entry["cross_ts"]     = cross_ts
+                    state_entry["entry_reason"] = item.get("entry_reason", "momentum")
+                price_state[s] = state_entry
 
         if new_items:
             save_auto_watchlist(auto_watchlist)
             save_price_state(price_state)
+
+            # Separate golden cross coins from momentum coins for different alerts
+            cross_items    = [i for i in new_items if i.get("entry_reason") == "golden_cross"]
+            momentum_items = [i for i in new_items if i.get("entry_reason") != "golden_cross"]
 
             def _fmt_entry(item):
                 sym   = item["symbol"]
@@ -468,11 +517,48 @@ def run_screener(auto_watchlist: list, price_state: dict):
                         f"  EMA200 {fmt.format(e200)}"
                         f"  (+{pct:.1f}%)  vol {vr}×avg")
 
-            send_telegram(
-                f"🔍 Screener found {len(new_items)} new trending coin(s):\n"
-                + "\n".join(_fmt_entry(item) for item in sorted(new_items, key=lambda x: x["symbol"]))
-                + f"\nAuto-list total: {len(auto_watchlist)}"
-            )
+            def _fmt_cross_entry(item):
+                sym     = item["symbol"]
+                c       = item["close"]
+                e50     = item["ema50"]
+                e200    = item["ema200"]
+                prec    = max(len(f"{c:.8f}".rstrip("0").split(".")[-1]), 2)
+                fmt     = f"{{:.{prec}f}}"
+                gap_pct = round((e50 - e200) / e200 * 100, 2)
+                # Show actual cross candle time, not current time
+                cross_ts = item.get("cross_ts")
+                try:
+                    cross_dt  = datetime.fromisoformat(cross_ts)
+                    hours_ago = int((datetime.utcnow() - cross_dt.replace(tzinfo=None)).total_seconds() / 3600)
+                    time_str  = f"crossed {cross_dt.strftime('%d %b %H:%M UTC')}"
+                    if hours_ago > 0:
+                        time_str += f" ({hours_ago}h ago)"
+                except Exception:
+                    time_str = f"detected {datetime.utcnow().strftime('%H:%M UTC')}"
+                return (f"{'─' * 22}\n"
+                        f"🌟 GOLDEN CROSS — {sym}\n"
+                        f"{'─' * 22}\n"
+                        f"EMA50  crossed above EMA200\n"
+                        f"EMA50   {fmt.format(e50)}\n"
+                        f"EMA200  {fmt.format(e200)}  (+{gap_pct}%)\n"
+                        f"Price   {fmt.format(c)}\n"
+                        f"\nWatch for pullbacks to EMA50\n"
+                        f"{time_str}\n"
+                        f"[auto-added to watchlist]")
+
+            # Fire individual golden cross alerts — one per coin
+            for item in sorted(cross_items, key=lambda x: x["symbol"]):
+                msg = _fmt_cross_entry(item)
+                print(msg)
+                send_telegram(msg)
+
+            # Batch momentum coins into a single summary
+            if momentum_items:
+                send_telegram(
+                    f"🔍 Screener found {len(momentum_items)} new trending coin(s):\n"
+                    + "\n".join(_fmt_entry(item) for item in sorted(momentum_items, key=lambda x: x["symbol"]))
+                    + f"\nAuto-list total: {len(auto_watchlist)}"
+                )
         else:
             print("  Screener: no new trending coins.")
             send_telegram(
