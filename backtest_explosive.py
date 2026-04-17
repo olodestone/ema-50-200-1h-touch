@@ -21,15 +21,26 @@ kucoin = ccxt.kucoin({
 mexc = ccxt.mexc({"enableRateLimit": True, "options": {"defaultType": "spot"}})
 
 
+def _resolve_sym(exchange, sym):
+    """Return the actual market symbol to use (handles swap fallback)."""
+    if sym in exchange.markets:
+        return sym
+    base = sym.split("/")[0]
+    swap = f"{base}/USDT:USDT"
+    return swap if swap in exchange.markets else sym
+
+
 def fetch_daily(exchange, sym, limit=300):
-    # Resolve the actual market symbol (spot or swap)
-    actual_sym = sym
-    if sym not in exchange.markets:
-        base = sym.split("/")[0]
-        swap_sym = f"{base}/USDT:USDT"
-        if swap_sym in exchange.markets:
-            actual_sym = swap_sym
-    raw = exchange.fetch_ohlcv(actual_sym, "1d", limit=limit)
+    actual = _resolve_sym(exchange, sym)
+    raw = exchange.fetch_ohlcv(actual, "1d", limit=limit)
+    df  = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    return _compute(df)
+
+
+def fetch_1h(exchange, sym, limit=300):
+    actual = _resolve_sym(exchange, sym)
+    raw = exchange.fetch_ohlcv(actual, "1h", limit=limit)
     df  = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     return _compute(df)
@@ -68,19 +79,19 @@ def run_backtest(sym, exchange, exch_name):
     print(f"  {sym}  [{exch_name}]")
     print(f"{'═'*52}")
 
-    df = fetch_daily(exchange, sym)
+    df_d  = fetch_daily(exchange, sym)
+    df_1h = fetch_1h(exchange, sym, limit=500)   # ~21 days of 1h candles
 
-    exp_iloc = find_explosion_start(df)
+    exp_iloc = find_explosion_start(df_d)
     if exp_iloc is None:
         print("  Could not identify explosion day in recent data.")
         return
 
-    exp_row   = df.iloc[exp_iloc]
-    prev_row  = df.iloc[exp_iloc - 1]
-    exp_date  = exp_row["ts"].strftime("%Y-%m-%d")
-    exp_pct   = (exp_row["close"] - prev_row["close"]) / prev_row["close"] * 100
-    exp_close = exp_row["close"]
-    peak_close = df.iloc[exp_iloc: exp_iloc + 14]["close"].max()  # 14-day peak after explosion
+    exp_row    = df_d.iloc[exp_iloc]
+    prev_row   = df_d.iloc[exp_iloc - 1]
+    exp_date   = exp_row["ts"].strftime("%Y-%m-%d")
+    exp_pct    = (exp_row["close"] - prev_row["close"]) / prev_row["close"] * 100
+    peak_close = df_d.iloc[exp_iloc: exp_iloc + 14]["close"].max()
 
     print(f"  Explosion day : {exp_date}  +{exp_pct:.1f}% on the day")
     print(f"  Price before  : {prev_row['close']:.6g}")
@@ -91,36 +102,49 @@ def run_backtest(sym, exchange, exch_name):
 
     first_signal = None
 
-    # Day-by-day simulation: scanner runs on morning of day T, sees closed candle T-1
-    # exp_iloc is the explosion candle. We scan T = exp_iloc-13 .. exp_iloc+7
-    # (+7 handles staircase patterns where the main surge comes days after the initial move)
+    # Day-by-day simulation: scanner runs at 00:30 UTC, sees all candles up to T-1.
+    # exp_iloc is the explosion candle. Scan from 13d before to 8d after.
     for days_before in range(13, -8, -1):
-        # Scanner runs "the morning after" candle at (exp_iloc - days_before)
-        # So the window includes one extra row so iloc[-2] == the candle we want to check
-        end = exp_iloc - days_before + 2
-        if end < 25 or end > len(df):
+        end_d = exp_iloc - days_before + 2
+        if end_d < 26 or end_d > len(df_d):
             continue
 
-        window     = df.iloc[:end].copy()
-        check_date = df.iloc[exp_iloc - days_before]["ts"].strftime("%Y-%m-%d")
-        check_close = df.iloc[exp_iloc - days_before]["close"]
+        window_d   = df_d.iloc[:end_d].copy()
+        check_date = df_d.iloc[exp_iloc - days_before]["ts"].strftime("%Y-%m-%d")
+        check_ts   = df_d.iloc[exp_iloc - days_before]["ts"]
+        check_close = df_d.iloc[exp_iloc - days_before]["close"]
 
-        for fn in (check_fresh_cross, check_coil, check_reversal, check_pullback):
-            sig = fn(window, sym, exch_name)
-            if sig:
-                remaining = (peak_close - check_close) / check_close * 100
-                timing = (f"{days_before}d BEFORE explosion"
-                          if days_before > 0 else
-                          "ON explosion day" if days_before == 0 else
-                          f"{abs(days_before)}d AFTER explosion")
-                print(f"  ✓  {sig['signal']:12s}  fired {check_date}  ({timing})")
-                print(f"     Price at signal : {check_close:.6g}")
-                print(f"     EMA50           : {sig['ema50']:.6g}   EMA200: {sig['ema200']:.6g}")
-                print(f"     Remaining upside: +{remaining:.0f}% to 14d peak")
-                print()
-                if first_signal is None:
-                    first_signal = (days_before, sig["signal"])
-                break   # one signal per day
+        # Slice 1h data up to the same point in time (250 candles = ~10 days back)
+        mask_1h   = df_1h["ts"] <= check_ts
+        window_1h = df_1h[mask_1h].iloc[-250:].copy() if mask_1h.any() else None
+
+        sig = None
+
+        # FRESH_CROSS uses 1h window
+        if window_1h is not None and len(window_1h) >= 25:
+            sig = check_fresh_cross(window_1h, sym, exch_name)
+
+        # Daily signals use daily window
+        if sig is None:
+            for fn in (check_coil, check_reversal, check_pullback):
+                sig = fn(window_d, sym, exch_name)
+                if sig:
+                    break
+
+        if sig:
+            remaining = (peak_close - check_close) / check_close * 100
+            timing = (f"{days_before}d BEFORE explosion"
+                      if days_before > 0 else
+                      "ON explosion day" if days_before == 0 else
+                      f"{abs(days_before)}d AFTER explosion")
+            extra = f"  path={sig['path']}" if "path" in sig else ""
+            print(f"  ✓  {sig['signal']:12s}  fired {check_date}  ({timing}){extra}")
+            print(f"     Price at signal : {check_close:.6g}")
+            print(f"     EMA50           : {sig['ema50']:.6g}   EMA200: {sig['ema200']:.6g}")
+            print(f"     Remaining upside: +{remaining:.0f}% to 14d peak")
+            print()
+            if first_signal is None:
+                first_signal = (days_before, sig["signal"])
 
     if first_signal is None:
         print("  ✗  No signal fired in the window. Screener would have MISSED this move.")

@@ -69,8 +69,17 @@ try:
         "options": {"defaultType": "spot"},
     })
 except Exception as _mexc_err:
-    print(f"MEXC exchange init failed: {_mexc_err} — explosive scan uses KuCoin only")
+    print(f"MEXC spot init failed: {_mexc_err}")
     mexc_exchange = None
+
+try:
+    mexc_swap_exchange = ccxt.mexc({
+        "enableRateLimit": True,
+        "options": {"defaultType": "swap"},
+    })
+except Exception as _mexc_swap_err:
+    print(f"MEXC swap init failed: {_mexc_swap_err}")
+    mexc_swap_exchange = None
 
 # ─── Alert cooldown state (persisted) ───────────────────────────────────────
 # key: "SYMBOL|label"  value: datetime of last alert sent
@@ -750,12 +759,12 @@ def send_explosive_alert(sig: dict):
         if cross_ts:
             try:
                 dt = pd.Timestamp(cross_ts)
-                cross_line = f"\nCrossed {dt.strftime('%d %b')} (daily)"
+                cross_line = f"\nCrossed {dt.strftime('%d %b %H:%M')} UTC (1h)"
             except Exception:
                 pass
-        header = f"🌟 DAILY FRESH CROSS — {sym}"
+        header = f"🌟 1H FRESH CROSS — {sym}"
         body = (
-            f"EMA50  crossed above EMA200\n"
+            f"EMA50  crossed above EMA200 on 1h\n"
             f"EMA50   {_efmt(ema50)}\n"
             f"EMA200  {_efmt(ema200)}  (+{gap_pct:.1f}%)\n"
             f"Close   {_efmt(close)}"
@@ -838,7 +847,7 @@ def run_explosive_scan(expl_state: dict):
     print(f"[{datetime.utcnow().strftime('%H:%M')}] Running daily explosive scan...")
     today_str = datetime.utcnow().strftime("%Y-%m-%d")
     try:
-        setups = scan_explosive_setups(exchange, mexc_exchange)
+        setups = scan_explosive_setups(exchange, mexc_exchange, mexc_swap=mexc_swap_exchange)
         expl_state["last_scan_date"] = today_str
         if not setups:
             print("  [explosive] No setups found today.")
