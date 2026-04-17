@@ -502,9 +502,10 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
             "\n"
             "Daily explosive setups:\n"
             "  /escan — run now (auto-runs 00:30 UTC daily)\n"
+            "  /setups — today's explosive scan results (anytime)\n"
             "\n"
             "Review missed alerts:\n"
-            "  /missed — last 10 alerts\n"
+            "  /missed — last 10 alerts (all types)\n"
             "  /missed 20 — last 20 alerts\n"
             "\n"
             "/help — this message"
@@ -577,6 +578,53 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
                 ema_val = r.get("ema_val", 0)
                 vr      = r.get("vol_ratio", 0)
                 lines.append(f"{em} {label} {kind.upper()} · {ts_str}\n{sym}\nClose {_efmt(c)}  {label} {_efmt(ema_val)}  Vol {vr}×")
+            lines.append(sep)
+        return "\n".join(lines)
+
+    # /setups — show today's (or last scan's) explosive setup alerts only
+    if lower in ("/setups", "setups", "/setups today", "setups today"):
+        explosive_only = [r for r in alert_history if r.get("kind") == "explosive"]
+        if not explosive_only:
+            return "No explosive setup alerts recorded yet."
+
+        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        today_hits = [r for r in explosive_only if r.get("ts", "").startswith(today_str)]
+        rows  = today_hits if today_hits else explosive_only
+        label = "Today's setups" if today_hits else "Last scan setups (none today yet)"
+
+        sep   = "═" * 22
+        lines = [f"{label} ({len(rows)} signal(s)):"]
+        lines.append(sep)
+        for r in rows:
+            try:
+                dt     = datetime.fromisoformat(r["ts"])
+                ts_str = dt.strftime("%d %b %H:%M UTC")
+            except Exception:
+                ts_str = str(r.get("ts", ""))[:16]
+            signal = r.get("signal", "")
+            sym    = r.get("symbol", "")
+            exch   = r.get("exchange", "")
+            close  = r.get("close", 0)
+            ema50  = r.get("ema50", 0)
+            ema200 = r.get("ema200", 0)
+            em     = {"FRESH_CROSS": "🌟", "COIL": "💥", "REVERSAL": "⚡", "PULLBACK": "🔁"}.get(signal, "📊")
+
+            detail = ""
+            if signal == "FRESH_CROSS":
+                detail = f"  EMA gap +{r.get('gap_pct', 0):.1f}%"
+            elif signal == "REVERSAL":
+                detail = f"  +{r.get('daily_pct', 0):.0f}% day  Vol {r.get('vol_ratio', 0)}×  Path {r.get('path','?')}"
+            elif signal == "COIL":
+                detail = f"  Vol {r.get('vol_ratio', 0)}×  Range {r.get('range_pct', 0):.0f}%"
+            elif signal == "PULLBACK":
+                detail = f"  Peak +{r.get('peak_pct', 0):.0f}%  Dist {r.get('dist_pct', 0):+.1f}%"
+
+            lines.append(
+                f"{em} {signal} · {ts_str}\n"
+                f"{sym}  [{exch}]\n"
+                f"Close {_efmt(close)}  EMA50 {_efmt(ema50)}  EMA200 {_efmt(ema200)}"
+                f"{detail}"
+            )
             lines.append(sep)
         return "\n".join(lines)
 
