@@ -15,12 +15,16 @@ import pandas as pd
 from datetime import datetime, timedelta
 from logger import send_telegram, get_updates
 from screener import scan_trending_coins
+from explosive_screener import scan_explosive_setups
 
 # ─── Config ────────────────────────────────────────────────────────────────
-WATCHLIST_FILE      = "watchlist.json"
-AUTO_WATCHLIST_FILE = "auto_watchlist.json"
-PRICE_STATE_FILE    = "price_state.json"
-ALERT_STATE_FILE    = "alert_state.json"
+WATCHLIST_FILE         = "watchlist.json"
+AUTO_WATCHLIST_FILE    = "auto_watchlist.json"
+PRICE_STATE_FILE       = "price_state.json"
+ALERT_STATE_FILE       = "alert_state.json"
+EXPLOSIVE_STATE_FILE   = "explosive_alerts.json"
+HISTORY_FILE           = "alert_history.json"
+HISTORY_MAX            = 50   # keep last N alerts across all types
 
 CHECK_INTERVAL        = 300           # seconds between candle checks (5 min)
 AUTO_SCAN_INTERVAL    = 3600          # seconds between screener scans (1 hour)
@@ -39,10 +43,19 @@ AUTO_REMOVE_THRESH    = 0.97          # auto-remove if close < EMA200 × this (3
 FRESH_CROSS_WINDOW    = 72            # hours — ⭐ tag, wider touch buffer, "fresh cross" label
 CROSS_INFO_WINDOW     = 336           # hours (14 days) — informational 📌 note on alerts
 
+EXPLOSIVE_COOLDOWNS = {
+    "FRESH_CROSS": timedelta(days=7),
+    "COIL":        timedelta(days=3),
+    "REVERSAL":    timedelta(days=3),
+    "PULLBACK":    timedelta(days=2),
+}
+EXPLOSIVE_SCAN_HOUR = 0   # run after this UTC hour (00:30 UTC daily)
+EXPLOSIVE_SCAN_MIN  = 30
+
 TOKEN   = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# ─── Exchange ───────────────────────────────────────────────────────────────
+# ─── Exchanges ──────────────────────────────────────────────────────────────
 exchange = ccxt.kucoin({
     "apiKey":    os.getenv("KUCOIN_API_KEY",    ""),
     "secret":    os.getenv("KUCOIN_SECRET",     ""),
@@ -50,10 +63,23 @@ exchange = ccxt.kucoin({
     "enableRateLimit": True,
 })
 
+try:
+    mexc_exchange = ccxt.mexc({
+        "enableRateLimit": True,
+        "options": {"defaultType": "spot"},
+    })
+except Exception as _mexc_err:
+    print(f"MEXC exchange init failed: {_mexc_err} — explosive scan uses KuCoin only")
+    mexc_exchange = None
+
 # ─── Alert cooldown state (persisted) ───────────────────────────────────────
 # key: "SYMBOL|label"  value: datetime of last alert sent
 # Persisted so restarts don't re-fire alerts within the 4h cooldown window.
 last_alert: dict = {}
+
+# ─── Alert history (persisted) ───────────────────────────────────────────────
+# Rolling list of last HISTORY_MAX alert records across all alert types.
+alert_history: list = []
 
 # ─── Persistence ─────────────────────────────────────────────────────────────
 def load_watchlist() -> list:
@@ -119,6 +145,49 @@ def save_alert_state(state: dict):
     """Persist last_alert to disk. Converts datetime values to ISO strings."""
     with open(ALERT_STATE_FILE, "w") as f:
         json.dump({k: v.isoformat() for k, v in state.items()}, f, indent=2)
+
+
+def load_explosive_state() -> dict:
+    """Load explosive scan state: last_scan_date + per-signal cooldown timestamps."""
+    if not os.path.exists(EXPLOSIVE_STATE_FILE):
+        return {"last_scan_date": None, "alerts": {}}
+    try:
+        with open(EXPLOSIVE_STATE_FILE) as f:
+            data = json.load(f)
+        alerts = {k: datetime.fromisoformat(v) for k, v in data.get("alerts", {}).items()}
+        return {"last_scan_date": data.get("last_scan_date"), "alerts": alerts}
+    except Exception:
+        return {"last_scan_date": None, "alerts": {}}
+
+
+def save_explosive_state(state: dict):
+    with open(EXPLOSIVE_STATE_FILE, "w") as f:
+        json.dump({
+            "last_scan_date": state.get("last_scan_date"),
+            "alerts": {k: v.isoformat() for k, v in state["alerts"].items()},
+        }, f, indent=2)
+
+
+def load_history() -> list:
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    try:
+        with open(HISTORY_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_history():
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(alert_history[-HISTORY_MAX:], f, indent=2)
+
+
+def append_history(record: dict):
+    alert_history.append(record)
+    if len(alert_history) > HISTORY_MAX:
+        alert_history[:] = alert_history[-HISTORY_MAX:]
+    save_history()
 
 
 # ─── Symbol normalisation ────────────────────────────────────────────────────
@@ -386,6 +455,15 @@ def send_alert(alert: dict):
     )
     print(msg)
     send_telegram(msg)
+    append_history({
+        "ts":        datetime.utcnow().isoformat(timespec="seconds"),
+        "kind":      kind,
+        "symbol":    symbol,
+        "label":     label,
+        "close":     close,
+        "ema_val":   ema_val,
+        "vol_ratio": vol_ratio,
+    })
 
 
 # ─── Telegram command handler ─────────────────────────────────────────────────
@@ -413,6 +491,13 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
             "  /autounwatch BTC — remove from auto-list\n"
             "  /scan — run screener now\n"
             "\n"
+            "Daily explosive setups:\n"
+            "  /escan — run now (auto-runs 00:30 UTC daily)\n"
+            "\n"
+            "Review missed alerts:\n"
+            "  /missed — last 10 alerts\n"
+            "  /missed 20 — last 20 alerts\n"
+            "\n"
             "/help — this message"
         )
 
@@ -433,6 +518,58 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
     # /scan — handled in main loop; return sentinel
     if lower in ("/scan", "scan"):
         return "SCAN"
+
+    # /escan — trigger daily explosive scan manually
+    if lower in ("/escan", "escan"):
+        return "ESCAN"
+
+    # /missed [N] — show last N alerts (default 10, max 20)
+    if lower.startswith("/missed") or lower == "missed":
+        parts = text.split()
+        n = 10
+        if len(parts) > 1:
+            try:
+                n = max(1, min(20, int(parts[1])))
+            except ValueError:
+                pass
+        if not alert_history:
+            return "No alerts recorded yet."
+        recent = alert_history[-n:][::-1]  # newest first
+        lines  = [f"Last {len(recent)} alert(s) — newest first:"]
+        sep    = "─" * 22
+        lines.append(sep)
+        for r in recent:
+            try:
+                dt     = datetime.fromisoformat(r["ts"])
+                ts_str = dt.strftime("%d %b %H:%M UTC")
+            except Exception:
+                ts_str = str(r.get("ts", ""))[:16]
+            kind = r.get("kind", "")
+            sym  = r.get("symbol", "")
+            if kind == "explosive":
+                signal = r.get("signal", "")
+                exch   = r.get("exchange", "")
+                em     = {"FRESH_CROSS": "🌟", "COIL": "💥", "REVERSAL": "⚡", "PULLBACK": "🔁"}.get(signal, "📊")
+                c      = r.get("close", 0)
+                e50    = r.get("ema50", 0)
+                extra  = ""
+                if signal == "COIL":
+                    extra = f"  Vol {r.get('vol_ratio', 0)}×"
+                elif signal == "PULLBACK":
+                    extra = f"  Peak +{r.get('peak_pct', 0):.0f}%"
+                elif signal == "FRESH_CROSS":
+                    extra = f"  Gap +{r.get('gap_pct', 0):.1f}%"
+                lines.append(f"{em} {signal} · {ts_str}\n{sym} · {exch}\nClose {_efmt(c)}  EMA50 {_efmt(e50)}{extra}")
+            else:
+                label   = r.get("label", "EMA?")
+                em_map  = {"touch": "📍", "pullback": "🔄", "breakdown": "⚠️"}
+                em      = em_map.get(kind, "📍")
+                c       = r.get("close", 0)
+                ema_val = r.get("ema_val", 0)
+                vr      = r.get("vol_ratio", 0)
+                lines.append(f"{em} {label} {kind.upper()} · {ts_str}\n{sym}\nClose {_efmt(c)}  {label} {_efmt(ema_val)}  Vol {vr}×")
+            lines.append(sep)
+        return "\n".join(lines)
 
     # /unwatch SYMBOL
     if lower.startswith("/unwatch ") or lower.startswith("unwatch "):
@@ -589,6 +726,144 @@ def run_screener(auto_watchlist: list, price_state: dict):
         print(f"Screener error: {e}")
 
 
+# ─── Explosive daily alert formatting ────────────────────────────────────────
+def _efmt(p: float) -> str:
+    if p >= 1000:  return f"{p:,.2f}"
+    if p >= 1:     return f"{p:.4f}"
+    if p >= 0.01:  return f"{p:.6f}"
+    return f"{p:.8f}"
+
+
+def send_explosive_alert(sig: dict):
+    sym    = sig["symbol"]
+    exch   = sig["exchange"]
+    signal = sig["signal"]
+    close  = sig["close"]
+    ema50  = sig["ema50"]
+    ema200 = sig["ema200"]
+    date_str = datetime.utcnow().strftime("%d %b %Y")
+
+    if signal == "FRESH_CROSS":
+        gap_pct  = sig.get("gap_pct", 0)
+        cross_ts = sig.get("cross_ts", "")
+        cross_line = ""
+        if cross_ts:
+            try:
+                dt = pd.Timestamp(cross_ts)
+                cross_line = f"\nCrossed {dt.strftime('%d %b')} (daily)"
+            except Exception:
+                pass
+        header = f"🌟 DAILY FRESH CROSS — {sym}"
+        body = (
+            f"EMA50  crossed above EMA200\n"
+            f"EMA50   {_efmt(ema50)}\n"
+            f"EMA200  {_efmt(ema200)}  (+{gap_pct:.1f}%)\n"
+            f"Close   {_efmt(close)}"
+            f"{cross_line}\n"
+            f"\nExplosive move likely ahead"
+        )
+
+    elif signal == "COIL":
+        vol_ratio = sig.get("vol_ratio", 0)
+        range_pct = sig.get("range_pct", 0)
+        ema_gap   = sig.get("ema_gap", 0)
+        header = f"💥 DAILY COIL BREAKOUT — {sym}"
+        body = (
+            f"Dormant {range_pct:.0f}% range (14d)\n"
+            f"EMAs compressed ({ema_gap:.1f}% gap)\n"
+            f"Volume  {vol_ratio}× avg  ← surge\n"
+            f"Close   {_efmt(close)}\n"
+            f"EMA50   {_efmt(ema50)}\n"
+            f"EMA200  {_efmt(ema200)}"
+        )
+
+    elif signal == "REVERSAL":
+        vol_ratio  = sig.get("vol_ratio", 0)
+        daily_pct  = sig.get("daily_pct", 0)
+        ema_gap    = sig.get("ema_gap_pct", 0)
+        header = f"⚡ DAILY REVERSAL — {sym}"
+        body = (
+            f"Downtrend broken — first explosive surge\n"
+            f"+{daily_pct:.0f}% on the day  Vol {vol_ratio}× avg\n"
+            f"Close broke {((close/ema50 - 1)*100):.0f}% above EMA50\n"
+            f"EMA50   {_efmt(ema50)}  (EMA200 {ema_gap:.0f}% above)\n"
+            f"Close   {_efmt(close)}"
+        )
+
+    else:  # PULLBACK
+        dist_pct = sig.get("dist_pct", 0)
+        peak_pct = sig.get("peak_pct", 0)
+        header = f"🔁 DAILY PULLBACK ENTRY — {sym}"
+        body = (
+            f"After +{peak_pct:.0f}% run above EMA50\n"
+            f"Now {dist_pct:+.1f}% from EMA50\n"
+            f"EMA50   {_efmt(ema50)}\n"
+            f"EMA200  {_efmt(ema200)}\n"
+            f"Close   {_efmt(close)}"
+        )
+
+    msg = (
+        f"{'═' * 22}\n"
+        f"{header}\n"
+        f"[{exch}]\n"
+        f"{'═' * 22}\n"
+        f"{body}\n"
+        f"\nDaily candle · {date_str}"
+    )
+    print(msg)
+    send_telegram(msg)
+    record = {
+        "ts":       datetime.utcnow().isoformat(timespec="seconds"),
+        "kind":     "explosive",
+        "signal":   signal,
+        "symbol":   sym,
+        "exchange": exch,
+        "close":    close,
+        "ema50":    ema50,
+        "ema200":   ema200,
+    }
+    if signal == "FRESH_CROSS":
+        record["gap_pct"] = sig.get("gap_pct", 0)
+    elif signal == "COIL":
+        record["vol_ratio"] = sig.get("vol_ratio", 0)
+        record["range_pct"] = sig.get("range_pct", 0)
+    elif signal == "PULLBACK":
+        record["dist_pct"] = sig.get("dist_pct", 0)
+        record["peak_pct"] = sig.get("peak_pct", 0)
+    append_history(record)
+
+
+def run_explosive_scan(expl_state: dict):
+    """Run the daily explosive setup scan and fire Telegram alerts."""
+    print(f"[{datetime.utcnow().strftime('%H:%M')}] Running daily explosive scan...")
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    try:
+        setups = scan_explosive_setups(exchange, mexc_exchange)
+        expl_state["last_scan_date"] = today_str
+        if not setups:
+            print("  [explosive] No setups found today.")
+            save_explosive_state(expl_state)
+            return
+        fired = 0
+        for sig in setups:
+            key  = f"{sig['symbol']}|{sig['signal']}"
+            cd   = EXPLOSIVE_COOLDOWNS.get(sig["signal"], timedelta(days=2))
+            prev = expl_state["alerts"].get(key)
+            if prev is None or (datetime.utcnow() - prev) >= cd:
+                send_explosive_alert(sig)
+                expl_state["alerts"][key] = datetime.utcnow()
+                fired += 1
+            else:
+                remaining = cd - (datetime.utcnow() - prev)
+                print(f"  {sig['symbol']} {sig['signal']} — cooldown ({int(remaining.total_seconds()/3600)}h left)")
+        save_explosive_state(expl_state)
+        print(f"  [explosive] {fired} alert(s) fired.")
+    except Exception as e:
+        print(f"[explosive] Scan error: {e}")
+        expl_state["last_scan_date"] = today_str
+        save_explosive_state(expl_state)
+
+
 # ─── Main loop ────────────────────────────────────────────────────────────────
 def run():
     print("EMA 50/200 Touch Bot started.")
@@ -598,6 +873,7 @@ def run():
     auto_watchlist = load_auto_watchlist()
     price_state    = load_price_state()
     last_alert.update(load_alert_state())
+    alert_history[:] = load_history()
 
     if watchlist:
         send_telegram(f"Resumed manual watchlist: {', '.join(watchlist)}")
@@ -607,6 +883,9 @@ def run():
     tg_offset     = 0
     last_check_ts = 0.0
     last_scan_ts  = 0.0  # 0 so screener runs immediately on first boot
+
+    expl_state              = load_explosive_state()
+    last_explosive_scan_date = expl_state.get("last_scan_date")  # None → run immediately
 
     while True:
         # ── Poll Telegram for commands ──────────────────────────────────────
@@ -624,17 +903,31 @@ def run():
                     send_telegram("Running screener scan... this may take a minute.")
                     run_screener(auto_watchlist, price_state)
                     last_scan_ts = time.time()
+                elif reply == "ESCAN":
+                    send_telegram("Running daily explosive setup scan... this may take a few minutes.")
+                    run_explosive_scan(expl_state)
+                    last_explosive_scan_date = datetime.utcnow().strftime("%Y-%m-%d")
                 elif reply:
                     send_telegram(reply)
         except Exception as e:
             print(f"TG poll error: {e}")
 
-        now = time.time()
+        now     = time.time()
+        now_utc = datetime.utcnow()
 
         # ── Auto-screener: hourly (or on /scan) ────────────────────────────
         if now - last_scan_ts >= AUTO_SCAN_INTERVAL:
             last_scan_ts = now
             run_screener(auto_watchlist, price_state)
+
+        # ── Daily explosive scan: once per day at 00:30 UTC (or on first boot) ──
+        today_str = now_utc.strftime("%Y-%m-%d")
+        after_cutoff = now_utc.hour > EXPLOSIVE_SCAN_HOUR or (
+            now_utc.hour == EXPLOSIVE_SCAN_HOUR and now_utc.minute >= EXPLOSIVE_SCAN_MIN
+        )
+        if today_str != last_explosive_scan_date and (last_explosive_scan_date is None or after_cutoff):
+            last_explosive_scan_date = today_str
+            run_explosive_scan(expl_state)
 
         # ── EMA checks every CHECK_INTERVAL ────────────────────────────────
         if now - last_check_ts >= CHECK_INTERVAL:
