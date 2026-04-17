@@ -80,7 +80,7 @@ def run_backtest(sym, exchange, exch_name):
     print(f"{'═'*52}")
 
     df_d  = fetch_daily(exchange, sym)
-    df_1h = fetch_1h(exchange, sym, limit=500)   # ~21 days of 1h candles
+    df_1h = fetch_1h(exchange, sym, limit=1000)  # ~41 days — keeps 250+ after back-slicing
 
     exp_iloc = find_explosion_start(df_d)
     if exp_iloc is None:
@@ -120,8 +120,8 @@ def run_backtest(sym, exchange, exch_name):
 
         sig = None
 
-        # FRESH_CROSS uses 1h window
-        if window_1h is not None and len(window_1h) >= 25:
+        # FRESH_CROSS uses 1h window — need ≥ 250 candles for EMA200 to converge
+        if window_1h is not None and len(window_1h) >= 250:
             sig = check_fresh_cross(window_1h, sym, exch_name)
 
         # Daily signals use daily window
