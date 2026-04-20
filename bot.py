@@ -505,8 +505,9 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
             "  /setups — today's explosive scan results (anytime)\n"
             "\n"
             "Review missed alerts:\n"
-            "  /missed — last 10 alerts (all types)\n"
-            "  /missed 20 — last 20 alerts\n"
+            "  /missed — last 5 per signal type\n"
+            "  /missed fresh_cross — filter to one type\n"
+            "  /missed coil 10 — filter + count\n"
             "\n"
             "/help — this message"
         )
@@ -533,22 +534,34 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
     if lower in ("/escan", "escan"):
         return "ESCAN"
 
-    # /missed [N] — show last N alerts (default 10, max 20)
+    # /missed [type|N] — show last N per signal type, or filter to one type
+    # e.g. /missed fresh_cross  /missed coil 10  /missed touch  /missed 5
     if lower.startswith("/missed") or lower == "missed":
         parts = text.split()
-        n = 10
-        if len(parts) > 1:
-            try:
-                n = max(1, min(20, int(parts[1])))
-            except ValueError:
-                pass
-        if not alert_history:
-            return "No alerts recorded yet."
-        recent = alert_history[-n:][::-1]  # newest first
-        lines  = [f"Last {len(recent)} alert(s) — newest first:"]
-        sep    = "─" * 22
-        lines.append(sep)
-        for r in recent:
+        n = 5
+        filter_type = None  # (kind, signal_or_None) tuple, or None = all
+
+        SIGNAL_ALIASES = {
+            "fresh_cross": ("explosive", "FRESH_CROSS"),
+            "freshcross":  ("explosive", "FRESH_CROSS"),
+            "coil":        ("explosive", "COIL"),
+            "reversal":    ("explosive", "REVERSAL"),
+            "pullback":    ("explosive", "PULLBACK"),
+            "touch":       ("touch",     None),
+            "breakdown":   ("breakdown", None),
+            "ema_pullback":("pullback",  None),
+        }
+
+        for p in parts[1:]:
+            pl = p.lower()
+            if pl in SIGNAL_ALIASES:
+                filter_type = SIGNAL_ALIASES[pl]
+            else:
+                try:
+                    n = max(1, min(20, int(p)))
+                except ValueError:
+                    pass
+        def _fmt_record(r):
             try:
                 dt     = datetime.fromisoformat(r["ts"])
                 ts_str = dt.strftime("%d %b %H:%M UTC")
@@ -569,7 +582,7 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
                     extra = f"  Peak +{r.get('peak_pct', 0):.0f}%"
                 elif signal == "FRESH_CROSS":
                     extra = f"  Gap +{r.get('gap_pct', 0):.1f}%"
-                lines.append(f"{em} {signal} · {ts_str}\n{sym} · {exch}\nClose {_efmt(c)}  EMA50 {_efmt(e50)}{extra}")
+                return f"{em} {signal} · {ts_str}\n{sym} · {exch}\nClose {_efmt(c)}  EMA50 {_efmt(e50)}{extra}"
             else:
                 label   = r.get("label", "EMA?")
                 em_map  = {"touch": "📍", "pullback": "🔄", "breakdown": "⚠️"}
@@ -577,8 +590,64 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
                 c       = r.get("close", 0)
                 ema_val = r.get("ema_val", 0)
                 vr      = r.get("vol_ratio", 0)
-                lines.append(f"{em} {label} {kind.upper()} · {ts_str}\n{sym}\nClose {_efmt(c)}  {label} {_efmt(ema_val)}  Vol {vr}×")
+                return f"{em} {label} {kind.upper()} · {ts_str}\n{sym}\nClose {_efmt(c)}  {label} {_efmt(ema_val)}  Vol {vr}×"
+
+        TYPE_ORDER = [
+            ("explosive", "FRESH_CROSS"),
+            ("explosive", "COIL"),
+            ("explosive", "REVERSAL"),
+            ("explosive", "PULLBACK"),
+            ("touch",     None),
+            ("pullback",  None),
+            ("breakdown", None),
+        ]
+
+        def _type_key(r):
+            kind = r.get("kind", "")
+            return (kind, r.get("signal", "") if kind == "explosive" else None)
+
+        display_types = [filter_type] if filter_type else TYPE_ORDER
+
+        buckets: dict = {}
+        for r in reversed(alert_history):  # newest first
+            k = _type_key(r)
+            if filter_type and k != filter_type:
+                continue
+            buckets.setdefault(k, [])
+            if len(buckets[k]) < n:
+                buckets[k].append(r)
+
+        sep   = "─" * 22
+        if filter_type:
+            kind, sig = filter_type
+            label = sig if sig else kind.upper()
+            lines = [f"Last {n} {label} alerts — newest first:"]
+        else:
+            lines = [f"Last {n} per type — newest first:"]
+
+        for tk in display_types:
+            rows = buckets.get(tk, [])
+            kind, sig = tk
+            section = sig if sig else kind.upper()
+            if not rows:
+                lines.append(f"\n── {section} (none) ──")
+                continue
+            lines.append(f"\n── {section} ({len(rows)}) ──")
             lines.append(sep)
+            for r in rows:
+                lines.append(_fmt_record(r))
+                lines.append(sep)
+
+        # Catch unknown types (only when not filtering)
+        if not filter_type:
+            for k, rows in buckets.items():
+                if k not in TYPE_ORDER and rows:
+                    lines.append(f"\n── OTHER ({len(rows)}) ──")
+                    lines.append(sep)
+                    for r in rows:
+                        lines.append(_fmt_record(r))
+                        lines.append(sep)
+
         return "\n".join(lines)
 
     # /setups — show today's (or last scan's) explosive setup alerts only
