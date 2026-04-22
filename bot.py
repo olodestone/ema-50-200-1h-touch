@@ -50,7 +50,8 @@ EXPLOSIVE_COOLDOWNS = {
     "REVERSAL":    timedelta(days=3),
     "PULLBACK":    timedelta(days=2),
 }
-EXPLOSIVE_SCAN_SLOTS = [0, 8, 16]  # UTC hours — scan fires at HH:30 (00:30, 08:30, 16:30 UTC)
+EXPLOSIVE_SCAN_SLOTS         = [0, 8, 16]  # UTC hours — scan fires at HH:30 (00:30, 08:30, 16:30 UTC)
+FRESH_CROSS_BATCH_THRESHOLD  = 8           # above this many FRESH_CROSS in one scan → send summary instead of individual alerts
 
 OUTCOMES_FILE = "outcomes.json"
 
@@ -1251,6 +1252,49 @@ def send_explosive_alert(sig: dict):
     record_outcome(sig)
 
 
+def _send_fresh_cross_batch(sigs: list[dict]):
+    """
+    Single summary Telegram message when ≥ FRESH_CROSS_BATCH_THRESHOLD coins fire
+    FRESH_CROSS in the same scan — indicates a market-wide recovery, not individual setups.
+    Shows top 8 by tightest EMA gap (smallest gap = freshest cross = most upside remaining).
+    Also records each signal to history + outcomes for /missed and /performance.
+    """
+    n    = len(sigs)
+    top  = sorted(sigs, key=lambda s: s.get("gap_pct", 99))[:8]
+    date = datetime.utcnow().strftime("%d %b · %H:%M UTC")
+
+    lines = [
+        f"{'═' * 22}",
+        f"🌊 MARKET RECOVERY — {n} FRESH_CROSS",
+        f"Broad 1H golden crosses · {date}",
+        f"{'═' * 22}",
+        f"Tightest EMA gap (most upside):",
+    ]
+    for i, s in enumerate(top, 1):
+        confl = " ⚡" if s.get("confluence") else ""
+        lines.append(f"  {i}. {s['symbol']}  +{s.get('gap_pct', 0):.1f}% gap  [{s['exchange']}]{confl}")
+    lines.append("\nUse /best for full ranked list")
+    msg = "\n".join(lines)
+    print(msg)
+    send_telegram(msg)
+
+    # Record every signal to history + outcomes even though only a summary was sent
+    for sig in sigs:
+        append_history({
+            "ts":         datetime.utcnow().isoformat(timespec="seconds"),
+            "kind":       "explosive",
+            "signal":     "FRESH_CROSS",
+            "symbol":     sig["symbol"],
+            "exchange":   sig["exchange"],
+            "close":      sig["close"],
+            "ema50":      sig["ema50"],
+            "ema200":     sig["ema200"],
+            "confluence": sig.get("confluence", False),
+            "gap_pct":    sig.get("gap_pct", 0),
+        })
+        record_outcome(sig)
+
+
 def run_explosive_scan(expl_state: dict):
     """Run the explosive setup scan and fire Telegram alerts."""
     print(f"[{datetime.utcnow().strftime('%H:%M')}] Running explosive scan...")
@@ -1269,8 +1313,37 @@ def run_explosive_scan(expl_state: dict):
             print("  [explosive] No setups found.")
             save_explosive_state(expl_state)
             return
+
         fired = 0
-        for sig in setups:
+        cd_fc = EXPLOSIVE_COOLDOWNS["FRESH_CROSS"]
+
+        # Split FRESH_CROSS from rarer signals — batch if market-wide recovery
+        fc_sigs    = [s for s in setups if s["signal"] == "FRESH_CROSS"]
+        other_sigs = [s for s in setups if s["signal"] != "FRESH_CROSS"]
+
+        # Apply cooldown to FRESH_CROSS candidates
+        fc_to_fire = [
+            s for s in fc_sigs
+            if (lambda k: expl_state["alerts"].get(k) is None or
+                (datetime.utcnow() - expl_state["alerts"][k]) >= cd_fc
+            )(f"{s['symbol']}|FRESH_CROSS")
+        ]
+
+        if len(fc_to_fire) >= FRESH_CROSS_BATCH_THRESHOLD:
+            # Market-wide recovery — one summary instead of N individual messages
+            _send_fresh_cross_batch(fc_to_fire)
+            for s in fc_to_fire:
+                expl_state["alerts"][f"{s['symbol']}|FRESH_CROSS"] = datetime.utcnow()
+            fired += len(fc_to_fire)
+            print(f"  [explosive] FRESH_CROSS batch: {len(fc_to_fire)} signals → 1 summary sent.")
+        else:
+            for sig in fc_to_fire:
+                send_explosive_alert(sig)
+                expl_state["alerts"][f"{sig['symbol']}|FRESH_CROSS"] = datetime.utcnow()
+                fired += 1
+
+        # COIL / REVERSAL / PULLBACK — always individual alerts
+        for sig in other_sigs:
             key  = f"{sig['symbol']}|{sig['signal']}"
             cd   = EXPLOSIVE_COOLDOWNS.get(sig["signal"], timedelta(days=2))
             prev = expl_state["alerts"].get(key)
@@ -1281,6 +1354,7 @@ def run_explosive_scan(expl_state: dict):
             else:
                 remaining = cd - (datetime.utcnow() - prev)
                 print(f"  {sig['symbol']} {sig['signal']} — cooldown ({int(remaining.total_seconds()/3600)}h left)")
+
         save_explosive_state(expl_state)
         print(f"  [explosive] {fired} alert(s) fired.")
     except Exception as e:

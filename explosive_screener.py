@@ -26,9 +26,14 @@ Confluence flag is set when ≥2 signals agree on the same coin.
 Parallel: each exchange scanned with ThreadPoolExecutor(max_workers=8).
 """
 
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
+
+# Leveraged tokens (e.g. LINK3L, AAVE3S, DOGE2L) — always follow the underlying,
+# produce constant false signals, and aren't tradeable setups.
+_LEVERAGED_RE = re.compile(r'\d+[LlSs]$')
 
 TOP_N                   = 300   # top pairs by 24h quote volume per exchange
 VOL_SURGE_MULT          = 3.0   # COIL: vol > vol_ma × this on breakout day
@@ -302,6 +307,9 @@ def _top_pairs(exchange, top_n: int = TOP_N) -> list[str]:
     pairs = []
     for sym, t in tickers.items():
         if not sym.endswith("/USDT") or sym in EXCLUDED:
+            continue
+        base = sym.split("/")[0]
+        if _LEVERAGED_RE.search(base):   # skip 3L, 3S, 2L, 2S etc. leveraged tokens
             continue
         m = exchange.markets.get(sym, {})
         if m.get("type") not in (None, "spot"):
