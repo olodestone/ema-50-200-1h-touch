@@ -866,7 +866,7 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
                           f"Range {r.get('range_pct', 0):.0f}%  "
                           f"EMA gap {r.get('ema_gap', 0):.1f}%")
             elif sig == "REVERSAL":
-                metric = (f"+{r.get('daily_pct', 0):.0f}% day  "
+                metric = (f"{r.get('daily_pct', 0):+.0f}% day  "
                           f"Vol {r.get('vol_ratio', 0)}×")
             elif sig == "FRESH_CROSS":
                 metric = f"EMA gap +{r.get('gap_pct', 0):.1f}%"
@@ -965,7 +965,7 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
             if signal == "FRESH_CROSS":
                 detail = f"  EMA gap +{r.get('gap_pct', 0):.1f}%"
             elif signal == "REVERSAL":
-                detail = f"  +{r.get('daily_pct', 0):.0f}% day  Vol {r.get('vol_ratio', 0)}×  Path {r.get('path','?')}"
+                detail = f"  {r.get('daily_pct', 0):+.0f}% day  Vol {r.get('vol_ratio', 0)}×  Path {r.get('path','?')}"
             elif signal == "COIL":
                 detail = f"  Vol {r.get('vol_ratio', 0)}×  Range {r.get('range_pct', 0):.0f}%"
             elif signal == "PULLBACK":
@@ -1193,7 +1193,7 @@ def send_explosive_alert(sig: dict):
         header = f"⚡ DAILY REVERSAL — {sym}"
         body = (
             f"Downtrend broken — first explosive surge\n"
-            f"+{daily_pct:.0f}% on the day  Vol {vol_ratio}× avg\n"
+            f"{daily_pct:+.0f}% on the day  Vol {vol_ratio}× avg\n"
             f"Close broke {((close/ema50 - 1)*100):.0f}% above EMA50\n"
             f"EMA50   {_efmt(ema50)}  (EMA200 {ema_gap:.0f}% above)\n"
             f"Close   {_efmt(close)}"

@@ -220,7 +220,8 @@ def check_reversal(df: pd.DataFrame, sym: str, exch: str) -> dict | None:
     )
     path_c = (
         close > ema50 and
-        vol >= vol_ma * REV_C_VOL_MULT
+        vol >= vol_ma * REV_C_VOL_MULT and
+        daily_pct >= 0
     )
     if not (path_a or path_b or path_c):
         return None
@@ -371,6 +372,16 @@ def _fetch_1h(exchange, sym: str) -> pd.DataFrame | None:
         return None
 
 
+def _is_near_peg(df_1h: pd.DataFrame) -> bool:
+    """Return True if this looks like a USD-pegged stablecoin (GUSD, USDD, etc.)."""
+    c = float(df_1h.iloc[-2]["close"])
+    if not (0.95 <= c <= 1.05):
+        return False
+    w = df_1h.iloc[-168:]  # last 7 days of 1h candles
+    rng = (w["high"].max() - w["low"].min()) / w["close"].mean()
+    return rng < 0.02
+
+
 def _scan_one(sym: str, exch, exch_name: str, display_sym: str | None = None) -> list[dict]:
     """
     Fetch 1h + daily for one symbol, run ALL signal checks, return every matching signal.
@@ -382,6 +393,9 @@ def _scan_one(sym: str, exch, exch_name: str, display_sym: str | None = None) ->
     time.sleep(0.1)
     df_d = _fetch_daily(exch, sym)
     time.sleep(0.1)
+
+    if df_1h is not None and _is_near_peg(df_1h):
+        return []
 
     signals = []
     if df_1h is not None:
@@ -445,13 +459,13 @@ def scan_explosive_setups(
     seen    = set()
 
     spot_exchanges = [
-        ("KuCoin",  kucoin),
-        ("MEXC",    mexc),
-        ("Binance", binance),
-        ("Gate.io", gate),
+        ("KuCoin",  kucoin,   6),
+        ("MEXC",    mexc,     5),
+        ("Binance", binance,  6),
+        ("Gate.io", gate,     4),
     ]
 
-    for exch_name, exch in spot_exchanges:
+    for exch_name, exch, workers in spot_exchanges:
         if exch is None:
             continue
         print(f"  [explosive] {exch_name}: loading pairs...")
@@ -463,7 +477,7 @@ def scan_explosive_setups(
                 seen.add(base)
                 tasks.append((sym, exch, exch_name, None))
         print(f"  [explosive] {exch_name}: scanning {len(tasks)} new pair(s)...")
-        results.extend(_run_parallel(tasks))
+        results.extend(_run_parallel(tasks, max_workers=workers))
 
     # MEXC swap pass — catches futures-only coins not listed on any spot exchange
     if mexc_swap is not None:
@@ -477,7 +491,7 @@ def scan_explosive_setups(
                 display_sym = swap_sym.split(":")[0]
                 tasks.append((swap_sym, mexc_swap, "MEXC-swap", display_sym))
         print(f"  [explosive] MEXC-swap: scanning {len(tasks)} new pair(s)...")
-        results.extend(_run_parallel(tasks))
+        results.extend(_run_parallel(tasks, max_workers=3))
 
     total_coins = len({r["symbol"] for r in results})
     print(f"  [explosive] Done: {len(results)} signal(s) across {total_coins} coin(s).")
