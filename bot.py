@@ -24,7 +24,8 @@ PRICE_STATE_FILE       = "price_state.json"
 ALERT_STATE_FILE       = "alert_state.json"
 EXPLOSIVE_STATE_FILE   = "explosive_alerts.json"
 HISTORY_FILE           = "alert_history.json"
-HISTORY_MAX            = 50   # keep last N alerts across all types
+HISTORY_MAX            = 500  # keep last N alerts across all types
+OUTCOME_MAX            = 500  # keep last N outcome records
 
 CHECK_INTERVAL        = 300           # seconds between candle checks (5 min)
 AUTO_SCAN_INTERVAL    = 3600          # seconds between screener scans (1 hour)
@@ -49,8 +50,9 @@ EXPLOSIVE_COOLDOWNS = {
     "REVERSAL":    timedelta(days=3),
     "PULLBACK":    timedelta(days=2),
 }
-EXPLOSIVE_SCAN_HOUR = 0   # run after this UTC hour (00:30 UTC daily)
-EXPLOSIVE_SCAN_MIN  = 30
+EXPLOSIVE_SCAN_SLOTS = [0, 8, 16]  # UTC hours — scan fires at HH:30 (00:30, 08:30, 16:30 UTC)
+
+OUTCOMES_FILE = "outcomes.json"
 
 TOKEN   = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -81,6 +83,23 @@ except Exception as _mexc_swap_err:
     print(f"MEXC swap init failed: {_mexc_swap_err}")
     mexc_swap_exchange = None
 
+try:
+    binance_exchange = ccxt.binance({
+        "enableRateLimit": True,
+        "options": {"defaultType": "spot"},
+    })
+except Exception as _binance_err:
+    print(f"Binance init failed: {_binance_err}")
+    binance_exchange = None
+
+try:
+    gate_exchange = ccxt.gateio({
+        "enableRateLimit": True,
+    })
+except Exception as _gate_err:
+    print(f"Gate.io init failed: {_gate_err}")
+    gate_exchange = None
+
 # ─── Alert cooldown state (persisted) ───────────────────────────────────────
 # key: "SYMBOL|label"  value: datetime of last alert sent
 # Persisted so restarts don't re-fire alerts within the 4h cooldown window.
@@ -89,6 +108,10 @@ last_alert: dict = {}
 # ─── Alert history (persisted) ───────────────────────────────────────────────
 # Rolling list of last HISTORY_MAX alert records across all alert types.
 alert_history: list = []
+
+# ─── Signal outcome tracking (persisted) ─────────────────────────────────────
+# Records each explosive alert with d1/d3/d7 price change vs entry, updated hourly.
+outcomes: list = []
 
 # ─── Persistence ─────────────────────────────────────────────────────────────
 def load_watchlist() -> list:
@@ -157,24 +180,43 @@ def save_alert_state(state: dict):
 
 
 def load_explosive_state() -> dict:
-    """Load explosive scan state: last_scan_date + per-signal cooldown timestamps."""
+    """Load explosive scan state: fired_slots set + per-signal cooldown timestamps."""
     if not os.path.exists(EXPLOSIVE_STATE_FILE):
-        return {"last_scan_date": None, "alerts": {}}
+        return {"fired_slots": set(), "alerts": {}}
     try:
         with open(EXPLOSIVE_STATE_FILE) as f:
             data = json.load(f)
         alerts = {k: datetime.fromisoformat(v) for k, v in data.get("alerts", {}).items()}
-        return {"last_scan_date": data.get("last_scan_date"), "alerts": alerts}
+        fired  = set(data.get("fired_slots", []))
+        # Migrate from old last_scan_date format
+        if not fired and data.get("last_scan_date"):
+            fired.add(f"{data['last_scan_date']}_00")
+        return {"fired_slots": fired, "alerts": alerts}
     except Exception:
-        return {"last_scan_date": None, "alerts": {}}
+        return {"fired_slots": set(), "alerts": {}}
 
 
 def save_explosive_state(state: dict):
     with open(EXPLOSIVE_STATE_FILE, "w") as f:
         json.dump({
-            "last_scan_date": state.get("last_scan_date"),
-            "alerts": {k: v.isoformat() for k, v in state["alerts"].items()},
+            "fired_slots": sorted(state.get("fired_slots", [])),
+            "alerts":      {k: v.isoformat() for k, v in state["alerts"].items()},
         }, f, indent=2)
+
+
+def load_outcomes() -> list:
+    if not os.path.exists(OUTCOMES_FILE):
+        return []
+    try:
+        with open(OUTCOMES_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_outcomes(data: list):
+    with open(OUTCOMES_FILE, "w") as f:
+        json.dump(data[-OUTCOME_MAX:], f, indent=2)
 
 
 def load_history() -> list:
@@ -197,6 +239,90 @@ def append_history(record: dict):
     if len(alert_history) > HISTORY_MAX:
         alert_history[:] = alert_history[-HISTORY_MAX:]
     save_history()
+
+
+def record_outcome(sig: dict):
+    """Add a new explosive alert to outcomes for d1/d3/d7 price tracking."""
+    entry_id = f"{sig['symbol']}|{sig['signal']}|{datetime.utcnow().strftime('%Y-%m-%dT%H:%M')}"
+    outcomes.append({
+        "id":         entry_id,
+        "symbol":     sig["symbol"],
+        "signal":     sig["signal"],
+        "exchange":   sig["exchange"],
+        "fire_ts":    datetime.utcnow().isoformat(timespec="minutes"),
+        "entry":      sig["close"],
+        "confluence": sig.get("confluence", False),
+        "d1":         None,
+        "d3":         None,
+        "d7":         None,
+    })
+    if len(outcomes) > OUTCOME_MAX:
+        outcomes[:] = outcomes[-OUTCOME_MAX:]
+    save_outcomes(outcomes)
+
+
+def update_outcomes():
+    """
+    Fetch current price for tracked outcomes and fill in d1/d3/d7 milestones.
+    Called hourly. Uses fetch_ticker (fast) rather than OHLCV.
+    Only checks records within a 14-day window that still have null milestones.
+    """
+    if not outcomes:
+        return
+    now = datetime.utcnow()
+    exch_map = {"KuCoin": exchange}
+    if mexc_exchange:
+        exch_map["MEXC"] = mexc_exchange
+    if mexc_swap_exchange:
+        exch_map["MEXC-swap"] = mexc_swap_exchange
+    if binance_exchange:
+        exch_map["Binance"] = binance_exchange
+    if gate_exchange:
+        exch_map["Gate.io"] = gate_exchange
+
+    changed = False
+    for rec in outcomes:
+        if rec.get("d7") is not None:
+            continue
+        try:
+            fire_ts = datetime.fromisoformat(rec["fire_ts"])
+        except Exception:
+            continue
+        age_d = (now - fire_ts).total_seconds() / 86400
+        if age_d > 14:
+            continue
+
+        exch_name = rec.get("exchange", "KuCoin")
+        exch      = exch_map.get(exch_name, exchange)
+        sym       = rec["symbol"]
+        # Swap exchange expects BASE/USDT:USDT; display sym is stored as BASE/USDT
+        fetch_sym = (sym + ":USDT") if exch_name == "MEXC-swap" and not sym.endswith(":USDT") else sym
+
+        try:
+            ticker  = exch.fetch_ticker(fetch_sym)
+            current = ticker.get("last") or ticker.get("close")
+            if current is None:
+                continue
+        except Exception:
+            continue
+
+        entry = rec.get("entry", 0)
+        if not entry:
+            continue
+        pct = (current - entry) / entry * 100
+
+        if age_d >= 1 and rec.get("d1") is None:
+            rec["d1"] = round(pct, 1)
+            changed = True
+        if age_d >= 3 and rec.get("d3") is None:
+            rec["d3"] = round(pct, 1)
+            changed = True
+        if age_d >= 7 and rec.get("d7") is None:
+            rec["d7"] = round(pct, 1)
+            changed = True
+
+    if changed:
+        save_outcomes(outcomes)
 
 
 # ─── Symbol normalisation ────────────────────────────────────────────────────
@@ -475,6 +601,42 @@ def send_alert(alert: dict):
     })
 
 
+# ─── Setup scoring ────────────────────────────────────────────────────────────
+def _score_setup(r: dict) -> int:
+    """
+    Score an explosive signal record for daily ranking. Higher = better setup.
+
+    Base scores reflect explosive potential:
+      COIL 100 — dormant spring release, highest upside
+      REVERSAL 85 — downtrend broken, confirmed
+      FRESH_CROSS 70 — early 1h momentum, fires before daily confirms
+      PULLBACK 60 — second entry on a proven mover
+
+    Bonuses: confluence +50, signal-specific quality metrics up to +25.
+    """
+    sig  = r.get("signal", "")
+    base = {"COIL": 100, "REVERSAL": 85, "FRESH_CROSS": 70, "PULLBACK": 60}.get(sig, 50)
+    bonus = 50 if r.get("confluence") else 0
+
+    if sig == "COIL":
+        vol = r.get("vol_ratio", 0)
+        rng = r.get("range_pct", 25)
+        bonus += min(20, int(vol * 2))         # higher vol × → more energy released
+        bonus += max(0, 10 - int(rng / 2))     # tighter 14d range → more compressed
+    elif sig == "REVERSAL":
+        bonus += {"A": 15, "B": 10, "C": 5}.get(r.get("path", ""), 0)
+        bonus += min(10, int(r.get("vol_ratio", 0)))
+    elif sig == "FRESH_CROSS":
+        gap = r.get("gap_pct", 10)
+        bonus += max(0, 15 - int(gap))         # smaller EMA gap → fresher cross → more upside
+    elif sig == "PULLBACK":
+        bonus += min(20, int(r.get("peak_pct", 0) / 3))   # bigger prior run → more proven
+        dist = abs(r.get("dist_pct", 5))
+        bonus += max(0, 5 - int(dist))         # tighter to EMA50 → better entry
+
+    return base + bonus
+
+
 # ─── Telegram command handler ─────────────────────────────────────────────────
 def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | None:
     """
@@ -500,14 +662,18 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
             "  /autounwatch BTC — remove from auto-list\n"
             "  /scan — run screener now\n"
             "\n"
-            "Daily explosive setups:\n"
-            "  /escan — run now (auto-runs 00:30 UTC daily)\n"
-            "  /setups — today's explosive scan results (anytime)\n"
+            "Explosive setups (KuCoin+MEXC+Binance+Gate.io):\n"
+            "  /escan — run now (auto: 00:30 / 08:30 / 16:30 UTC)\n"
+            "  /best — today's setups ranked by quality score ← daily check\n"
+            "  /setups — full list, unranked\n"
             "\n"
             "Review missed alerts:\n"
             "  /missed — last 5 per signal type\n"
             "  /missed fresh_cross — filter to one type\n"
             "  /missed coil 10 — filter + count\n"
+            "\n"
+            "Signal performance:\n"
+            "  /performance — d7 win rate + avg return per signal type\n"
             "\n"
             "/help — this message"
         )
@@ -648,6 +814,122 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
                         lines.append(_fmt_record(r))
                         lines.append(sep)
 
+        return "\n".join(lines)
+
+    # /best — today's setups ranked by quality score
+    if lower in ("/best", "best", "/picks", "picks"):
+        explosive_only = [r for r in alert_history if r.get("kind") == "explosive"]
+        if not explosive_only:
+            return "No explosive setup data yet. Run /escan first."
+
+        today_str  = datetime.utcnow().strftime("%Y-%m-%d")
+        today_hits = [r for r in explosive_only if r.get("ts", "").startswith(today_str)]
+        rows       = today_hits if today_hits else explosive_only
+        scan_label = "TODAY" if today_hits else "LAST SCAN"
+
+        # Deduplicate: if same symbol+signal fired multiple times (e.g. 3× daily scan),
+        # keep only the highest-scored instance
+        seen_key: set = set()
+        unique_rows   = []
+        for r in sorted(rows, key=_score_setup, reverse=True):
+            k = f"{r.get('symbol')}|{r.get('signal')}"
+            if k not in seen_key:
+                seen_key.add(k)
+                unique_rows.append(r)
+
+        now_str = datetime.utcnow().strftime("%d %b · %H:%M UTC")
+        sep     = "─" * 22
+        lines   = [
+            f"{'═' * 22}",
+            f"📊 BEST SETUPS — {scan_label}",
+            f"{now_str}",
+            f"{'═' * 22}",
+        ]
+
+        for i, r in enumerate(unique_rows[:10], 1):
+            sig    = r.get("signal", "")
+            sym    = r.get("symbol", "")
+            exch   = r.get("exchange", "")
+            close  = r.get("close", 0)
+            ema50  = r.get("ema50", 0)
+            score  = _score_setup(r)
+            confl  = r.get("confluence", False)
+
+            stars    = "⭐⭐⭐" if score >= 140 else ("⭐⭐" if score >= 95 else "⭐")
+            path_tag = f" Path {r['path']}" if sig == "REVERSAL" and r.get("path") else ""
+            confl_tag= " ⚡" if confl else ""
+            headline = f"#{i} {stars}  {sig}{path_tag}{confl_tag}"
+
+            if sig == "COIL":
+                metric = (f"Vol {r.get('vol_ratio', 0)}×  "
+                          f"Range {r.get('range_pct', 0):.0f}%  "
+                          f"EMA gap {r.get('ema_gap', 0):.1f}%")
+            elif sig == "REVERSAL":
+                metric = (f"+{r.get('daily_pct', 0):.0f}% day  "
+                          f"Vol {r.get('vol_ratio', 0)}×")
+            elif sig == "FRESH_CROSS":
+                metric = f"EMA gap +{r.get('gap_pct', 0):.1f}%"
+            else:  # PULLBACK
+                metric = (f"Peak +{r.get('peak_pct', 0):.0f}%  "
+                          f"Dist {r.get('dist_pct', 0):+.1f}%")
+
+            lines += [
+                headline,
+                f"{sym}  [{exch}]",
+                metric,
+                f"Close {_efmt(close)}  EMA50 {_efmt(ema50)}",
+                sep,
+            ]
+
+        if len(unique_rows) == 0:
+            lines.append("No setups found for this period.")
+        return "\n".join(lines)
+
+    # /performance — d7 win rate and avg return per signal type
+    if lower in ("/performance", "performance", "/perf", "perf"):
+        if not outcomes:
+            return "No outcome data yet — appears after signals fire and 1/3/7 days pass."
+        SIGS = ["COIL", "REVERSAL", "FRESH_CROSS", "PULLBACK"]
+        lines = ["Signal Performance (d7 return vs entry)", "─" * 32]
+        any_data = False
+        for sig_type in SIGS:
+            recs     = [r for r in outcomes if r.get("signal") == sig_type]
+            if not recs:
+                continue
+            any_data = True
+            complete = [r for r in recs if r.get("d7") is not None]
+            pending  = [r for r in recs if r.get("d7") is None]
+            if complete:
+                avg_d7  = sum(r["d7"] for r in complete) / len(complete)
+                wins    = sum(1 for r in complete if r["d7"] > 0)
+                win_pct = wins / len(complete) * 100
+                best    = max(complete, key=lambda r: r["d7"])
+                worst   = min(complete, key=lambda r: r["d7"])
+                conf_total = sum(1 for r in complete if r.get("confluence"))
+                conf_wins  = sum(1 for r in complete if r.get("confluence") and r["d7"] > 0)
+                conf_line  = (f"\n  ⚡ Confluence: {conf_wins}/{conf_total} wins"
+                              if conf_total else "")
+                lines.append(
+                    f"\n{sig_type}\n"
+                    f"  Closed {len(complete)} | Win {win_pct:.0f}% | Avg d7 {avg_d7:+.1f}%\n"
+                    f"  Best:  {best['symbol']} {best['d7']:+.1f}%\n"
+                    f"  Worst: {worst['symbol']} {worst['d7']:+.1f}%"
+                    + (f"\n  Pending: {len(pending)}" if pending else "")
+                    + conf_line
+                )
+            else:
+                lines.append(f"\n{sig_type}\n  {len(pending)} pending (no d7 data yet)")
+        if not any_data:
+            return "No outcome data yet."
+        # Count outcomes where d7 never filled — likely delisted or crashed
+        stalled = sum(
+            1 for r in outcomes
+            if r.get("d7") is None
+            and r.get("fire_ts")
+            and (datetime.utcnow() - datetime.fromisoformat(r["fire_ts"])).days > 14
+        )
+        if stalled:
+            lines.append(f"\n⚠ {stalled} outcome(s) have no d7 data after 14 days (possible delisting or crash — not included in stats above)")
         return "\n".join(lines)
 
     # /setups — show today's (or last scan's) explosive setup alerts only
@@ -928,10 +1210,12 @@ def send_explosive_alert(sig: dict):
             f"Close   {_efmt(close)}"
         )
 
+    confluence_line = "\n⚡ CONFLUENCE — multiple signals agree" if sig.get("confluence") else ""
+
     msg = (
         f"{'═' * 22}\n"
         f"{header}\n"
-        f"[{exch}]\n"
+        f"[{exch}]{confluence_line}\n"
         f"{'═' * 22}\n"
         f"{body}\n"
         f"\nDaily candle · {date_str}"
@@ -939,35 +1223,50 @@ def send_explosive_alert(sig: dict):
     print(msg)
     send_telegram(msg)
     record = {
-        "ts":       datetime.utcnow().isoformat(timespec="seconds"),
-        "kind":     "explosive",
-        "signal":   signal,
-        "symbol":   sym,
-        "exchange": exch,
-        "close":    close,
-        "ema50":    ema50,
-        "ema200":   ema200,
+        "ts":         datetime.utcnow().isoformat(timespec="seconds"),
+        "kind":       "explosive",
+        "signal":     signal,
+        "symbol":     sym,
+        "exchange":   exch,
+        "close":      close,
+        "ema50":      ema50,
+        "ema200":     ema200,
+        "confluence": sig.get("confluence", False),
     }
     if signal == "FRESH_CROSS":
         record["gap_pct"] = sig.get("gap_pct", 0)
     elif signal == "COIL":
         record["vol_ratio"] = sig.get("vol_ratio", 0)
         record["range_pct"] = sig.get("range_pct", 0)
+        record["ema_gap"]   = sig.get("ema_gap", 0)
+    elif signal == "REVERSAL":
+        record["vol_ratio"]  = sig.get("vol_ratio", 0)
+        record["daily_pct"]  = sig.get("daily_pct", 0)
+        record["path"]       = sig.get("path", "?")
+        record["ema_gap_pct"]= sig.get("ema_gap_pct", 0)
     elif signal == "PULLBACK":
         record["dist_pct"] = sig.get("dist_pct", 0)
         record["peak_pct"] = sig.get("peak_pct", 0)
     append_history(record)
+    record_outcome(sig)
 
 
 def run_explosive_scan(expl_state: dict):
-    """Run the daily explosive setup scan and fire Telegram alerts."""
-    print(f"[{datetime.utcnow().strftime('%H:%M')}] Running daily explosive scan...")
-    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    """Run the explosive setup scan and fire Telegram alerts."""
+    print(f"[{datetime.utcnow().strftime('%H:%M')}] Running explosive scan...")
+    # Prune cooldown entries that have already expired — prevents unbounded dict growth
+    max_cd  = max(EXPLOSIVE_COOLDOWNS.values())
+    cutoff  = datetime.utcnow() - max_cd - timedelta(days=1)
+    expl_state["alerts"] = {k: v for k, v in expl_state["alerts"].items() if v > cutoff}
     try:
-        setups = scan_explosive_setups(exchange, mexc_exchange, mexc_swap=mexc_swap_exchange)
-        expl_state["last_scan_date"] = today_str
+        setups = scan_explosive_setups(
+            exchange, mexc_exchange,
+            mexc_swap=mexc_swap_exchange,
+            binance=binance_exchange,
+            gate=gate_exchange,
+        )
         if not setups:
-            print("  [explosive] No setups found today.")
+            print("  [explosive] No setups found.")
             save_explosive_state(expl_state)
             return
         fired = 0
@@ -986,7 +1285,6 @@ def run_explosive_scan(expl_state: dict):
         print(f"  [explosive] {fired} alert(s) fired.")
     except Exception as e:
         print(f"[explosive] Scan error: {e}")
-        expl_state["last_scan_date"] = today_str
         save_explosive_state(expl_state)
 
 
@@ -1010,8 +1308,19 @@ def run():
     last_check_ts = 0.0
     last_scan_ts  = 0.0  # 0 so screener runs immediately on first boot
 
-    expl_state              = load_explosive_state()
-    last_explosive_scan_date = expl_state.get("last_scan_date")  # None → run immediately
+    expl_state = load_explosive_state()
+    outcomes[:] = load_outcomes()
+
+    # First ever boot (no fired_slots in state) — run one scan immediately then
+    # mark all past slots as done so normal slot logic takes over from here.
+    if not expl_state["fired_slots"]:
+        _boot_utc   = datetime.utcnow()
+        _boot_today = _boot_utc.strftime("%Y-%m-%d")
+        for _sh in EXPLOSIVE_SCAN_SLOTS:
+            if _boot_utc.hour > _sh or (_boot_utc.hour == _sh and _boot_utc.minute >= 30):
+                expl_state["fired_slots"].add(f"{_boot_today}_{_sh:02d}")
+        save_explosive_state(expl_state)
+        run_explosive_scan(expl_state)
 
     while True:
         # ── Poll Telegram for commands ──────────────────────────────────────
@@ -1030,9 +1339,8 @@ def run():
                     run_screener(auto_watchlist, price_state)
                     last_scan_ts = time.time()
                 elif reply == "ESCAN":
-                    send_telegram("Running daily explosive setup scan... this may take a few minutes.")
+                    send_telegram("Running explosive setup scan... this may take a few minutes.")
                     run_explosive_scan(expl_state)
-                    last_explosive_scan_date = datetime.utcnow().strftime("%Y-%m-%d")
                 elif reply:
                     send_telegram(reply)
         except Exception as e:
@@ -1045,15 +1353,22 @@ def run():
         if now - last_scan_ts >= AUTO_SCAN_INTERVAL:
             last_scan_ts = now
             run_screener(auto_watchlist, price_state)
+            update_outcomes()
 
-        # ── Daily explosive scan: once per day at 00:30 UTC (or on first boot) ──
+        # ── Explosive scan: 3× daily at 00:30 / 08:30 / 16:30 UTC ──────────
         today_str = now_utc.strftime("%Y-%m-%d")
-        after_cutoff = now_utc.hour > EXPLOSIVE_SCAN_HOUR or (
-            now_utc.hour == EXPLOSIVE_SCAN_HOUR and now_utc.minute >= EXPLOSIVE_SCAN_MIN
-        )
-        if today_str != last_explosive_scan_date and (last_explosive_scan_date is None or after_cutoff):
-            last_explosive_scan_date = today_str
-            run_explosive_scan(expl_state)
+        for slot_hour in EXPLOSIVE_SCAN_SLOTS:
+            after_cutoff = (now_utc.hour > slot_hour or
+                            (now_utc.hour == slot_hour and now_utc.minute >= 30))
+            slot_key = f"{today_str}_{slot_hour:02d}"
+            if after_cutoff and slot_key not in expl_state["fired_slots"]:
+                expl_state["fired_slots"].add(slot_key)
+                cutoff_d = (now_utc - timedelta(days=7)).strftime("%Y-%m-%d")
+                expl_state["fired_slots"] = {
+                    s for s in expl_state["fired_slots"] if s[:10] >= cutoff_d
+                }
+                run_explosive_scan(expl_state)
+                break
 
         # ── EMA checks every CHECK_INTERVAL ────────────────────────────────
         if now - last_check_ts >= CHECK_INTERVAL:

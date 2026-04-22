@@ -1,7 +1,7 @@
 """
 Daily pre-explosion setup scanner.
-Uses 1h + 1d candles from KuCoin + MEXC (spot and swap) USDT pairs.
-Run once per day. Completely separate from the 1h EMA touch bot.
+Uses 1h + 1d candles from KuCoin + MEXC (spot and swap) + Binance + Gate.io USDT pairs.
+Run multiple times per day. Completely separate from the 1h EMA touch bot.
 
 Signals:
 
@@ -20,12 +20,17 @@ Signals:
 
   PULLBACK     — Had golden cross + 15%+ run, now pulling back to EMA50.
                  Missed-entry retest.
+
+Multi-signal: all matching signals are returned per coin.
+Confluence flag is set when ≥2 signals agree on the same coin.
+Parallel: each exchange scanned with ThreadPoolExecutor(max_workers=8).
 """
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 
-TOP_N                   = 150   # top pairs by 24h quote volume per exchange
+TOP_N                   = 300   # top pairs by 24h quote volume per exchange
 VOL_SURGE_MULT          = 3.0   # COIL: vol > vol_ma × this on breakout day
 COIL_RANGE_PCT          = 0.25  # COIL: 14-day (high-low)/avg must be < 25%
 COIL_EMA_GAP_PCT        = 0.20  # COIL: EMA50/EMA200 gap must be < 20%
@@ -33,7 +38,7 @@ FRESH_CROSS_1H_LOOKBACK = 72    # FRESH_CROSS: look back this many 1h candles (=
 PULL_PEAK_MIN_PCT       = 0.15  # PULLBACK: prior run above EMA50 must be ≥ 15%
 PULL_MAX_DIST_PCT       = 0.05  # PULLBACK: close must be within 5% above EMA50
 PULL_LOOKBACK           = 10    # PULLBACK: days to look back for prior peak
-PULL_CROSS_WINDOW       = 35    # PULLBACK: golden cross must be within 35 days
+PULL_CROSS_WINDOW       = 90    # PULLBACK: golden cross must be within 90 days (was 35 — too short, excluded valid setups after 5-week runs)
 
 REV_VOL_MULT         = 4.0   # REVERSAL path A: explosive volume (RAVE/ENJ)
 REV_MIN_DAILY_PCT    = 15.0  # REVERSAL path A: single-day move ≥ 15%
@@ -88,7 +93,6 @@ def check_fresh_cross(df_1h: pd.DataFrame, sym: str, exch: str) -> dict | None:
     if any(pd.isna(last[c]) for c in ["close", "ema50", "ema200"]):
         return None
 
-    # EMA50 must currently be above EMA200 (cross hasn't reversed)
     if last["ema50"] <= last["ema200"]:
         return None
     if last["close"] < last["ema50"] * 0.95:
@@ -133,7 +137,6 @@ def check_coil(df: pd.DataFrame, sym: str, exch: str) -> dict | None:
     if vol < vol_ma * VOL_SURGE_MULT:
         return None
 
-    # The 14 days BEFORE the explosion candle must show dormancy
     w = df.iloc[-16:-2]
     if len(w) < 10:
         return None
@@ -142,12 +145,10 @@ def check_coil(df: pd.DataFrame, sym: str, exch: str) -> dict | None:
     if price_range > COIL_RANGE_PCT:
         return None
 
-    # EMAs must be compressed — gap < 20% (raised from 12% to catch wider dormant bases)
     ema_gap = abs(ema50 - ema200) / ema200
     if ema_gap > COIL_EMA_GAP_PCT:
         return None
 
-    # Not already in an established uptrend (EMA50 > EMA200 the entire prior 20 days)
     if len(df) >= 25:
         if (df.iloc[-22:-2]["ema50"] > df.iloc[-22:-2]["ema200"]).all():
             return None
@@ -182,9 +183,9 @@ def check_reversal(df: pd.DataFrame, sym: str, exch: str) -> dict | None:
     if len(df) < 26:
         return None
 
-    explosive = df.iloc[-3]   # candidate explosive day
-    confirm   = df.iloc[-2]   # next closed candle — must confirm
-    prev      = df.iloc[-4]   # day before explosive
+    explosive = df.iloc[-3]
+    confirm   = df.iloc[-2]
+    prev      = df.iloc[-4]
 
     close  = explosive["close"]
     hi     = explosive["high"]
@@ -219,12 +220,10 @@ def check_reversal(df: pd.DataFrame, sym: str, exch: str) -> dict | None:
     if not (path_a or path_b or path_c):
         return None
 
-    # Confirmation gate: next candle must close above mid-range of explosive day
     explosive_mid = (hi + lo) / 2
     if confirm["close"] < explosive_mid:
         return None
 
-    # Coin must have been near/below EMA50 recently (not already running up)
     base_window = df.iloc[-(REV_BASE_WINDOW + 3):-3]
     if len(base_window) < REV_BASE_WINDOW:
         return None
@@ -364,91 +363,114 @@ def _fetch_1h(exchange, sym: str) -> pd.DataFrame | None:
         return None
 
 
-def scan_explosive_setups(kucoin, mexc=None, mexc_swap=None) -> list[dict]:
+def _scan_one(sym: str, exch, exch_name: str, display_sym: str | None = None) -> list[dict]:
     """
-    Scan KuCoin + MEXC spot + MEXC swap for pre-explosion setups.
+    Fetch 1h + daily for one symbol, run ALL signal checks, return every matching signal.
+    display_sym overrides sym in output (used for swap pairs: sym=BASE/USDT:USDT, display=BASE/USDT).
+    Confluence flag is set on each signal when ≥2 fire for the same coin.
+    """
+    show_sym = display_sym if display_sym is not None else sym
+    df_1h = _fetch_1h(exch, sym)
+    time.sleep(0.1)
+    df_d = _fetch_daily(exch, sym)
+    time.sleep(0.1)
+
+    signals = []
+    if df_1h is not None:
+        sig = check_fresh_cross(df_1h, show_sym, exch_name)
+        if sig:
+            signals.append(sig)
+    if df_d is not None:
+        for fn in (check_coil, check_reversal, check_pullback):
+            sig = fn(df_d, show_sym, exch_name)
+            if sig:
+                signals.append(sig)
+
+    if len(signals) >= 2:
+        for s in signals:
+            s["confluence"] = True
+
+    return signals
+
+
+def _run_parallel(tasks: list[tuple], max_workers: int = 8) -> list[dict]:
+    """
+    Execute _scan_one for each (sym, exch, exch_name, display_sym) task in parallel.
+    Returns all signals found across all tasks, printing results as they arrive.
+    """
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_scan_one, sym, exch, exch_name, display_sym):
+            (sym, display_sym or sym, exch_name)
+            for sym, exch, exch_name, display_sym in tasks
+        }
+        for future in as_completed(futures):
+            _sym, show_sym, exch_name = futures[future]
+            try:
+                sigs = future.result()
+                if sigs:
+                    results.extend(sigs)
+                    labels = "+".join(s["signal"] for s in sigs)
+                    confl  = " ⚡CONFLUENCE" if len(sigs) >= 2 else ""
+                    print(f"    ✓ {labels} — {show_sym} [{exch_name}]{confl}")
+            except Exception as e:
+                print(f"    [explosive] {show_sym}: {e}")
+    return results
+
+
+def scan_explosive_setups(
+    kucoin, mexc=None, mexc_swap=None, binance=None, gate=None
+) -> list[dict]:
+    """
+    Scan KuCoin + MEXC spot + Binance + Gate.io + MEXC swap for pre-explosion setups.
 
     FRESH_CROSS uses 1h candles; COIL/REVERSAL/PULLBACK use daily candles.
-    MEXC swap pass catches futures-only listings (e.g. BIANRENSHENGUSDT).
+    All matching signals are returned per coin (multi-signal, no priority suppression).
+    Confluence flag set when ≥2 signals agree on the same coin — highest conviction alert.
+    MEXC swap pass catches futures-only listings not on any spot exchange.
+    Uses ThreadPoolExecutor(max_workers=8) per exchange for parallel fetching.
 
-    Returns one signal per coin (priority: FRESH_CROSS > COIL > REVERSAL > PULLBACK).
+    Returns list of signal dicts — one or more per qualifying coin.
     """
-    results   = []
-    seen      = set()
-    exchanges = [("KuCoin", kucoin)]
-    if mexc is not None:
-        exchanges.append(("MEXC", mexc))
+    results = []
+    seen    = set()
 
-    # ── Spot passes (KuCoin + MEXC spot) ────────────────────────────────────
-    for exch_name, exch in exchanges:
+    spot_exchanges = [
+        ("KuCoin",  kucoin),
+        ("MEXC",    mexc),
+        ("Binance", binance),
+        ("Gate.io", gate),
+    ]
+
+    for exch_name, exch in spot_exchanges:
         if exch is None:
             continue
         print(f"  [explosive] {exch_name}: loading pairs...")
         candidates = _top_pairs(exch)
-        print(f"  [explosive] {exch_name}: scanning {len(candidates)} pairs (1h + daily)...")
-
+        tasks = []
         for sym in candidates:
             base = sym.split("/")[0]
-            if base in seen:
-                continue
-            seen.add(base)
+            if base not in seen:
+                seen.add(base)
+                tasks.append((sym, exch, exch_name, None))
+        print(f"  [explosive] {exch_name}: scanning {len(tasks)} new pair(s)...")
+        results.extend(_run_parallel(tasks))
 
-            df_1h = _fetch_1h(exch, sym)
-            time.sleep(0.15)
-            df_d  = _fetch_daily(exch, sym)
-
-            sig = None
-
-            if df_1h is not None:
-                sig = check_fresh_cross(df_1h, sym, exch_name)
-
-            if sig is None and df_d is not None:
-                for fn in (check_coil, check_reversal, check_pullback):
-                    sig = fn(df_d, sym, exch_name)
-                    if sig:
-                        break
-
-            if sig:
-                results.append(sig)
-                print(f"    ✓ {sig['signal']} — {sym} [{exch_name}]")
-
-            time.sleep(0.15)
-
-    # ── MEXC swap pass (futures-only coins not listed on spot) ───────────────
+    # MEXC swap pass — catches futures-only coins not listed on any spot exchange
     if mexc_swap is not None:
         print(f"  [explosive] MEXC-swap: loading pairs...")
         swap_candidates = _top_swap_pairs(mexc_swap)
-        print(f"  [explosive] MEXC-swap: scanning {len(swap_candidates)} pairs...")
-
+        tasks = []
         for swap_sym in swap_candidates:
             base = swap_sym.split("/")[0]
-            if base in seen:
-                continue
-            seen.add(base)
+            if base not in seen:
+                seen.add(base)
+                display_sym = swap_sym.split(":")[0]
+                tasks.append((swap_sym, mexc_swap, "MEXC-swap", display_sym))
+        print(f"  [explosive] MEXC-swap: scanning {len(tasks)} new pair(s)...")
+        results.extend(_run_parallel(tasks))
 
-            # Normalise display symbol: BIANRENSHENG/USDT:USDT → BIANRENSHENG/USDT
-            display_sym = swap_sym.split(":")[0]
-
-            df_1h = _fetch_1h(mexc_swap, swap_sym)
-            time.sleep(0.15)
-            df_d  = _fetch_daily(mexc_swap, swap_sym)
-
-            sig = None
-
-            if df_1h is not None:
-                sig = check_fresh_cross(df_1h, display_sym, "MEXC-swap")
-
-            if sig is None and df_d is not None:
-                for fn in (check_coil, check_reversal, check_pullback):
-                    sig = fn(df_d, display_sym, "MEXC-swap")
-                    if sig:
-                        break
-
-            if sig:
-                results.append(sig)
-                print(f"    ✓ {sig['signal']} — {display_sym} [MEXC-swap]")
-
-            time.sleep(0.15)
-
-    print(f"  [explosive] Done: {len(results)} setup(s) found.")
+    total_coins = len({r["symbol"] for r in results})
+    print(f"  [explosive] Done: {len(results)} signal(s) across {total_coins} coin(s).")
     return results
