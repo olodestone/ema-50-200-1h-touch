@@ -53,7 +53,9 @@ EXPLOSIVE_COOLDOWNS = {
 EXPLOSIVE_SCAN_SLOTS         = [0, 8, 16]  # UTC hours — scan fires at HH:30 (00:30, 08:30, 16:30 UTC)
 FRESH_CROSS_BATCH_THRESHOLD  = 8           # above this many FRESH_CROSS in one scan → send summary instead of individual alerts
 
-OUTCOMES_FILE = "outcomes.json"
+OUTCOMES_FILE            = "outcomes.json"
+PULLBACK_WATCH_FILE      = "pullback_watch.json"
+PULLBACK_WATCH_EXPIRY_DAYS = 7             # auto-expire entries older than this
 
 TOKEN   = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -113,6 +115,11 @@ alert_history: list = []
 # ─── Signal outcome tracking (persisted) ─────────────────────────────────────
 # Records each explosive alert with d1/d3/d7 price change vs entry, updated hourly.
 outcomes: list = []
+
+# ─── Pullback watch (persisted) ───────────────────────────────────────────────
+# Symbols registered from /best "ran away" setups — fires when price touches EMA50.
+# Key: symbol, Value: {exchange, signal, path, added_ts}
+pullback_watch: dict = {}
 
 # ─── Persistence ─────────────────────────────────────────────────────────────
 def load_watchlist() -> list:
@@ -242,20 +249,62 @@ def append_history(record: dict):
     save_history()
 
 
+def load_pullback_watch() -> dict:
+    if not os.path.exists(PULLBACK_WATCH_FILE):
+        return {}
+    try:
+        with open(PULLBACK_WATCH_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_pullback_watch():
+    with open(PULLBACK_WATCH_FILE, "w") as f:
+        json.dump(pullback_watch, f, indent=2)
+
+
 def record_outcome(sig: dict):
-    """Add a new explosive alert to outcomes for d1/d3/d7 price tracking."""
+    """Add a new explosive alert to outcomes for d1/d3/d7/d14/d30 price tracking."""
     entry_id = f"{sig['symbol']}|{sig['signal']}|{datetime.utcnow().strftime('%Y-%m-%dT%H:%M')}"
+    signal   = sig["signal"]
+    entry    = sig["close"]
+    ema50    = sig.get("ema50") or 0
+    ema200   = sig.get("ema200") or 0
+
+    # Target: fill the EMA gap for COIL/REVERSAL/FRESH_CROSS; prior high for PULLBACK
+    if signal in ("REVERSAL", "FRESH_CROSS", "COIL"):
+        target_price = ema200 if ema200 > entry else None
+    else:  # PULLBACK
+        peak_pct     = sig.get("peak_pct", 15)
+        target_price = ema50 * (1 + peak_pct / 100) if ema50 else None
+
+    stop_price = ema50 * 0.97 if ema50 else None
+
     outcomes.append({
-        "id":         entry_id,
-        "symbol":     sig["symbol"],
-        "signal":     sig["signal"],
-        "exchange":   sig["exchange"],
-        "fire_ts":    datetime.utcnow().isoformat(timespec="minutes"),
-        "entry":      sig["close"],
-        "confluence": sig.get("confluence", False),
-        "d1":         None,
-        "d3":         None,
-        "d7":         None,
+        "id":             entry_id,
+        "symbol":         sig["symbol"],
+        "signal":         signal,
+        "path":           sig.get("path"),
+        "exchange":       sig["exchange"],
+        "fire_ts":        datetime.utcnow().isoformat(timespec="minutes"),
+        "entry":          entry,
+        "ema50":          ema50,
+        "ema200":         ema200,
+        "target_price":   round(target_price, 8) if target_price else None,
+        "stop_price":     round(stop_price,   8) if stop_price   else None,
+        "confluence":     sig.get("confluence", False),
+        "peak_price":     entry,
+        "trough_price":   entry,
+        "target_hit":     False,
+        "target_hit_day": None,
+        "stop_hit":       False,
+        "stop_hit_day":   None,
+        "d1":  None,
+        "d3":  None,
+        "d7":  None,
+        "d14": None,
+        "d30": None,
     })
     if len(outcomes) > OUTCOME_MAX:
         outcomes[:] = outcomes[-OUTCOME_MAX:]
@@ -264,9 +313,10 @@ def record_outcome(sig: dict):
 
 def update_outcomes():
     """
-    Fetch current price for tracked outcomes and fill in d1/d3/d7 milestones.
+    Fetch current price for tracked outcomes and fill d1/d3/d7/d14/d30 milestones.
+    Also updates running peak/trough and checks whether target or stop was ever hit.
     Called hourly. Uses fetch_ticker (fast) rather than OHLCV.
-    Only checks records within a 14-day window that still have null milestones.
+    Tracks records up to 31 days after firing.
     """
     if not outcomes:
         return
@@ -283,20 +333,19 @@ def update_outcomes():
 
     changed = False
     for rec in outcomes:
-        if rec.get("d7") is not None:
+        if rec.get("d30") is not None:
             continue
         try:
             fire_ts = datetime.fromisoformat(rec["fire_ts"])
         except Exception:
             continue
         age_d = (now - fire_ts).total_seconds() / 86400
-        if age_d > 14:
+        if age_d > 31:
             continue
 
         exch_name = rec.get("exchange", "KuCoin")
         exch      = exch_map.get(exch_name, exchange)
         sym       = rec["symbol"]
-        # Swap exchange expects BASE/USDT:USDT; display sym is stored as BASE/USDT
         fetch_sym = (sym + ":USDT") if exch_name == "MEXC-swap" and not sym.endswith(":USDT") else sym
 
         try:
@@ -312,15 +361,43 @@ def update_outcomes():
             continue
         pct = (current - entry) / entry * 100
 
-        if age_d >= 1 and rec.get("d1") is None:
-            rec["d1"] = round(pct, 1)
+        # Update running peak and trough
+        peak   = rec.get("peak_price",   current)
+        trough = rec.get("trough_price", current)
+        if current > peak:
+            rec["peak_price"]  = current
+            peak    = current
             changed = True
-        if age_d >= 3 and rec.get("d3") is None:
-            rec["d3"] = round(pct, 1)
+        if current < trough:
+            rec["trough_price"] = current
+            trough  = current
             changed = True
-        if age_d >= 7 and rec.get("d7") is None:
-            rec["d7"] = round(pct, 1)
+
+        # Check target hit (via peak — catches intra-period highs)
+        target = rec.get("target_price")
+        if target and not rec.get("target_hit") and peak >= target:
+            rec["target_hit"]     = True
+            rec["target_hit_day"] = int(age_d) + 1
             changed = True
+
+        # Check stop hit (via trough)
+        stop = rec.get("stop_price")
+        if stop and not rec.get("stop_hit") and trough <= stop:
+            rec["stop_hit"]     = True
+            rec["stop_hit_day"] = int(age_d) + 1
+            changed = True
+
+        # Fill point-in-time milestones
+        if age_d >= 1  and rec.get("d1")  is None:
+            rec["d1"]  = round(pct, 1); changed = True
+        if age_d >= 3  and rec.get("d3")  is None:
+            rec["d3"]  = round(pct, 1); changed = True
+        if age_d >= 7  and rec.get("d7")  is None:
+            rec["d7"]  = round(pct, 1); changed = True
+        if age_d >= 14 and rec.get("d14") is None:
+            rec["d14"] = round(pct, 1); changed = True
+        if age_d >= 30 and rec.get("d30") is None:
+            rec["d30"] = round(pct, 1); changed = True
 
     if changed:
         save_outcomes(outcomes)
@@ -638,6 +715,53 @@ def _score_setup(r: dict) -> int:
     return base + bonus
 
 
+# ─── Pullback watch: EMA50 touch check ───────────────────────────────────────
+def check_pullback_watch_touch(symbol: str, exch_name: str) -> dict | None:
+    """
+    Fetches live 1h OHLCV, computes EMA50, returns alert dict if the last
+    closed candle touched EMA50. No volume gate — we're specifically waiting
+    for this level.
+    """
+    exch_obj = (
+        {"KuCoin": exchange, "Gate.io": gate_exchange,
+         "Binance": binance_exchange, "MEXC": mexc_exchange}
+        .get(exch_name, exchange)
+    )
+    if exch_obj is None:
+        exch_obj = exchange
+    try:
+        raw = exch_obj.fetch_ohlcv(symbol, "1h", limit=220)
+        df  = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+    except Exception as e:
+        print(f"  pullback_watch fetch error {symbol}: {e}")
+        return None
+
+    df = compute_emas(df)
+    if len(df) < 55:
+        return None
+    last  = df.iloc[-2]
+    close = last["close"]
+    high  = last["high"]
+    low   = last["low"]
+    ema50 = last["ema50"]
+    if pd.isna(ema50) or pd.isna(close):
+        return None
+
+    candle_touched = low <= ema50 <= high
+    close_near     = abs(close - ema50) / ema50 <= TOUCH_BUFFER
+    if not (candle_touched or close_near):
+        return None
+
+    candle_ts = last["ts"].strftime("%H:%M UTC") if hasattr(last["ts"], "strftime") else ""
+    return {
+        "symbol":    symbol,
+        "ema50":     round(ema50, 8),
+        "close":     round(close, 8),
+        "candle_ts": candle_ts,
+    }
+
+
 # ─── Telegram command handler ─────────────────────────────────────────────────
 def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | None:
     """
@@ -674,7 +798,7 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
             "  /missed coil 10 — filter + count\n"
             "\n"
             "Signal performance:\n"
-            "  /performance — d7 win rate + avg return per signal type\n"
+            "  /performance — target hit rate, d1/d3/d7/d14/d30 returns per signal\n"
             "\n"
             "/help — this message"
         )
@@ -919,6 +1043,21 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
             else:  # PULLBACK
                 play = "▶ Second-chance entry — buy dip to EMA50 · Stop 3% below EMA50 · Target prior high"
 
+            # Auto-register ran-away setups for EMA50 pullback watch
+            watch_note = None
+            if ran_away:
+                if sym not in pullback_watch:
+                    pullback_watch[sym] = {
+                        "exchange": exch,
+                        "signal":   sig,
+                        "path":     path,
+                        "added_ts": datetime.utcnow().isoformat(),
+                    }
+                    save_pullback_watch()
+                    watch_note = "⏳ Watching for EMA50 pullback — alert will fire automatically"
+                else:
+                    watch_note = "⏳ Already watching for EMA50 pullback"
+
             entry = [
                 headline,
                 f"{sym}  [{exch}]",
@@ -927,50 +1066,114 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
             ]
             if now_line:
                 entry.append(now_line)
-            entry += [play, sep]
+            entry.append(play)
+            if watch_note:
+                entry.append(watch_note)
+            entry.append(sep)
             lines += entry
 
         if len(unique_rows) == 0:
             lines.append("No setups found for this period.")
         return "\n".join(lines)
 
-    # /performance — d7 win rate and avg return per signal type
+    # /performance — full signal performance: target hit rate, returns, path breakdown
     if lower in ("/performance", "performance", "/perf", "perf"):
         if not outcomes:
-            return "No outcome data yet — appears after signals fire and 1/3/7 days pass."
-        SIGS = ["COIL", "REVERSAL", "FRESH_CROSS", "PULLBACK"]
-        lines = ["Signal Performance (d7 return vs entry)", "─" * 32]
+            return "No outcome data yet — appears after signals fire and milestone days pass."
+
+        def _avg(vals):
+            v = [x for x in vals if x is not None]
+            return sum(v) / len(v) if v else None
+
+        SIGS    = ["COIL", "REVERSAL", "FRESH_CROSS", "PULLBACK"]
+        sep     = "─" * 26
+        now_str = datetime.utcnow().strftime("%d %b %Y · %H:%M UTC")
+        lines   = [
+            "═" * 26,
+            "📊 SIGNAL PERFORMANCE",
+            now_str,
+            "═" * 26,
+        ]
         any_data = False
+
         for sig_type in SIGS:
-            recs     = [r for r in outcomes if r.get("signal") == sig_type]
+            recs    = [r for r in outcomes if r.get("signal") == sig_type]
             if not recs:
                 continue
             any_data = True
-            complete = [r for r in recs if r.get("d7") is not None]
-            pending  = [r for r in recs if r.get("d7") is None]
-            if complete:
-                avg_d7  = sum(r["d7"] for r in complete) / len(complete)
-                wins    = sum(1 for r in complete if r["d7"] > 0)
-                win_pct = wins / len(complete) * 100
-                best    = max(complete, key=lambda r: r["d7"])
-                worst   = min(complete, key=lambda r: r["d7"])
-                conf_total = sum(1 for r in complete if r.get("confluence"))
-                conf_wins  = sum(1 for r in complete if r.get("confluence") and r["d7"] > 0)
-                conf_line  = (f"\n  ⚡ Confluence: {conf_wins}/{conf_total} wins"
-                              if conf_total else "")
-                lines.append(
-                    f"\n{sig_type}\n"
-                    f"  Closed {len(complete)} | Win {win_pct:.0f}% | Avg d7 {avg_d7:+.1f}%\n"
-                    f"  Best:  {best['symbol']} {best['d7']:+.1f}%\n"
-                    f"  Worst: {worst['symbol']} {worst['d7']:+.1f}%"
-                    + (f"\n  Pending: {len(pending)}" if pending else "")
-                    + conf_line
-                )
-            else:
-                lines.append(f"\n{sig_type}\n  {len(pending)} pending (no d7 data yet)")
+
+            # "closed" = d7 filled (enough time has passed for a meaningful read)
+            closed  = [r for r in recs if r.get("d7") is not None]
+            pending = [r for r in recs if r.get("d7") is None]
+
+            block = [f"\n{sig_type}  ({len(recs)} total · {len(closed)} closed)"]
+
+            if closed:
+                # Target / stop hit rates (only for records that have target_price set)
+                with_target = [r for r in closed if r.get("target_price")]
+                t_hit       = [r for r in with_target if r.get("target_hit")]
+                s_hit       = [r for r in closed if r.get("stop_hit")]
+                if with_target:
+                    avg_t_day = _avg([r.get("target_hit_day") for r in t_hit])
+                    t_day_str = f"  avg {avg_t_day:.1f}d" if avg_t_day else ""
+                    block.append(
+                        f"  Target hit: {len(t_hit)}/{len(with_target)}"
+                        f" ({len(t_hit)/len(with_target)*100:.0f}%){t_day_str}"
+                    )
+                if s_hit or closed:
+                    block.append(
+                        f"  Stop hit:   {len(s_hit)}/{len(closed)}"
+                        f" ({len(s_hit)/len(closed)*100:.0f}%)"
+                    )
+
+                # Return milestones
+                block.append(sep)
+                milestone_parts = []
+                for label, key in [("d1","d1"),("d3","d3"),("d7","d7"),("d14","d14"),("d30","d30")]:
+                    avg = _avg([r.get(key) for r in closed])
+                    if avg is not None:
+                        milestone_parts.append(f"{label} {avg:+.1f}%")
+                if milestone_parts:
+                    # Two per line
+                    for i in range(0, len(milestone_parts), 2):
+                        block.append("  " + "   ".join(milestone_parts[i:i+2]))
+
+                # Best / worst by d7
+                best  = max(closed, key=lambda r: r.get("d7") or -999)
+                worst = min(closed, key=lambda r: r.get("d7") or 999)
+                block.append(sep)
+                block.append(f"  Best:  {best['symbol']} d7 {best.get('d7', 0):+.1f}%")
+                block.append(f"  Worst: {worst['symbol']} d7 {worst.get('d7', 0):+.1f}%")
+
+                # REVERSAL path breakdown
+                if sig_type == "REVERSAL":
+                    block.append(sep)
+                    for path_label in ("A", "B", "C"):
+                        path_recs = [r for r in closed if r.get("path") == path_label]
+                        if not path_recs:
+                            continue
+                        path_wp = [r for r in path_recs if r.get("target_hit")]
+                        p_with_t = [r for r in path_recs if r.get("target_price")]
+                        hit_str  = (f"{len(path_wp)}/{len(p_with_t)} target"
+                                    if p_with_t else f"{len(path_recs)} closed")
+                        block.append(f"  Path {path_label}: {hit_str}")
+
+                # Confluence
+                conf_recs = [r for r in closed if r.get("confluence")]
+                if conf_recs:
+                    conf_hit = [r for r in conf_recs if r.get("target_hit")]
+                    block.append(
+                        f"  ⚡ Confluence: {len(conf_hit)}/{len(conf_recs)} target hit"
+                    )
+
+            if pending:
+                block.append(f"  Pending: {len(pending)}")
+
+            lines += block
+
         if not any_data:
             return "No outcome data yet."
-        # Count outcomes where d7 never filled — likely delisted or crashed
+
         stalled = sum(
             1 for r in outcomes
             if r.get("d7") is None
@@ -978,7 +1181,10 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
             and (datetime.utcnow() - datetime.fromisoformat(r["fire_ts"])).days > 14
         )
         if stalled:
-            lines.append(f"\n⚠ {stalled} outcome(s) have no d7 data after 14 days (possible delisting or crash — not included in stats above)")
+            lines.append(
+                f"\n⚠ {stalled} outcome(s) stalled after 14d with no d7 data "
+                f"(possible delisting — not counted above)"
+            )
         return "\n".join(lines)
 
     # /setups — show today's (or last scan's) explosive setup alerts only
@@ -1420,6 +1626,7 @@ def run():
     price_state    = load_price_state()
     last_alert.update(load_alert_state())
     alert_history[:] = load_history()
+    pullback_watch.update(load_pullback_watch())
 
     if watchlist:
         send_telegram(f"Resumed manual watchlist: {', '.join(watchlist)}")
@@ -1565,6 +1772,54 @@ def run():
                     )
                 else:
                     save_price_state(price_state)
+
+            # ── Pullback watch: EMA50 touch check ──────────────────────────
+            if pullback_watch:
+                print(f"[{ts_str}] Checking {len(pullback_watch)} pullback-watch pair(s)...")
+                # Expire entries older than PULLBACK_WATCH_EXPIRY_DAYS
+                expired = [
+                    sym for sym, meta in pullback_watch.items()
+                    if (datetime.utcnow() - datetime.fromisoformat(meta["added_ts"])).days
+                       >= PULLBACK_WATCH_EXPIRY_DAYS
+                ]
+                for sym in expired:
+                    pullback_watch.pop(sym)
+                    print(f"  {sym} pullback-watch expired ({PULLBACK_WATCH_EXPIRY_DAYS}d)")
+                if expired:
+                    save_pullback_watch()
+
+                fired = []
+                for sym, meta in list(pullback_watch.items()):
+                    try:
+                        hit = check_pullback_watch_touch(sym, meta["exchange"])
+                        if hit:
+                            sig_tag  = meta["signal"]
+                            path_tag = f" Path {meta['path']}" if meta.get("path") else ""
+                            sep_line = "─" * 22
+                            msg = (
+                                f"{sep_line}\n"
+                                f"🎯 EMA50 PULLBACK REACHED — {sym}\n"
+                                f"{sep_line}\n"
+                                f"[from {sig_tag}{path_tag} scan]\n\n"
+                                f"Now   {_efmt(hit['close'])}\n"
+                                f"EMA50 {_efmt(hit['ema50'])}\n\n"
+                                f"▶ Enter here · Stop 3% below EMA50\n"
+                                f"1h candle · {hit['candle_ts']}\n"
+                                f"{sep_line}"
+                            )
+                            send_telegram(msg)
+                            fired.append(sym)
+                            print(f"  {sym} — EMA50 pullback reached, alert sent")
+                        else:
+                            print(f"  {sym} — not yet at EMA50")
+                    except Exception as e:
+                        print(f"  {sym} pullback-watch error: {e}")
+                    time.sleep(1.0)
+
+                if fired:
+                    for sym in fired:
+                        pullback_watch.pop(sym, None)
+                    save_pullback_watch()
 
         time.sleep(10)
 
