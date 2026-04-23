@@ -838,6 +838,23 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
                 seen_key.add(k)
                 unique_rows.append(r)
 
+        # Build exchange map for live price fetches
+        _best_exch_map = {"KuCoin": exchange}
+        if gate_exchange:
+            _best_exch_map["Gate.io"] = gate_exchange
+        if binance_exchange:
+            _best_exch_map["Binance"] = binance_exchange
+        if mexc_exchange:
+            _best_exch_map["MEXC"] = mexc_exchange
+
+        def _live_price(sym: str, exch_name: str) -> float | None:
+            try:
+                ex = _best_exch_map.get(exch_name, exchange)
+                t  = ex.fetch_ticker(sym)
+                return float(t["last"])
+            except Exception:
+                return None
+
         now_str = datetime.utcnow().strftime("%d %b · %H:%M UTC")
         sep     = "─" * 22
         lines   = [
@@ -874,13 +891,39 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
                 metric = (f"Peak +{r.get('peak_pct', 0):.0f}%  "
                           f"Dist {r.get('dist_pct', 0):+.1f}%")
 
-            lines += [
+            path = r.get("path", "")
+            if sig == "COIL":
+                play = "▶ Day 1 breakout — enter now or on dip to EMA50 · Stop below EMA50 · Trail up"
+            elif sig == "REVERSAL":
+                if path == "A":
+                    play = "▶ High-vol reversal confirmed — enter near close · Stop below EMA50 · Target EMA200"
+                elif path == "B":
+                    play = "▶ Big surge, moderate vol — wait for dip to EMA50 · Stop below EMA50 · Target EMA200"
+                else:  # C
+                    play = "▶ Vol explosion (price lagging) — wait for next close above EMA50 · Stop below EMA50"
+            elif sig == "FRESH_CROSS":
+                play = "▶ Golden cross just formed — buy near EMA50 support · Stop below EMA200 · Hold for trend"
+            else:  # PULLBACK
+                play = "▶ Second-chance entry — buy dip to EMA50 · Stop 3% below EMA50 · Target prior high"
+
+            now_price = _live_price(sym, exch)
+            if now_price and close:
+                chg     = (now_price - close) / close * 100
+                chg_str = f"{chg:+.1f}%"
+                now_line = f"Now  {_efmt(now_price)} ({chg_str})"
+            else:
+                now_line = None
+
+            entry = [
                 headline,
                 f"{sym}  [{exch}]",
                 metric,
-                f"Close {_efmt(close)}  EMA50 {_efmt(ema50)}",
-                sep,
+                f"Scan {_efmt(close)}  EMA50 {_efmt(ema50)}",
             ]
+            if now_line:
+                entry.append(now_line)
+            entry += [play, sep]
+            lines += entry
 
         if len(unique_rows) == 0:
             lines.append("No setups found for this period.")
