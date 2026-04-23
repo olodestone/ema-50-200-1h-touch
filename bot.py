@@ -891,12 +891,25 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
                 metric = (f"Peak +{r.get('peak_pct', 0):.0f}%  "
                           f"Dist {r.get('dist_pct', 0):+.1f}%")
 
+            now_price = _live_price(sym, exch)
+            if now_price and close:
+                chg      = (now_price - close) / close * 100
+                chg_str  = f"{chg:+.1f}%"
+                now_line = f"Now  {_efmt(now_price)} ({chg_str})"
+            else:
+                chg      = 0.0
+                now_line = None
+
+            ran_away = now_line and chg > 5.0
+
             path = r.get("path", "")
-            if sig == "COIL":
+            if ran_away:
+                play = f"▶ Ran +{chg:.0f}% since scan — entry missed · Wait for pullback to EMA50 · Stop below EMA50"
+            elif sig == "COIL":
                 play = "▶ Day 1 breakout — enter now or on dip to EMA50 · Stop below EMA50 · Trail up"
             elif sig == "REVERSAL":
                 if path == "A":
-                    play = "▶ High-vol reversal confirmed — enter near close · Stop below EMA50 · Target EMA200"
+                    play = "▶ High-vol reversal confirmed — enter near Scan price · Stop below EMA50 · Target EMA200"
                 elif path == "B":
                     play = "▶ Big surge, moderate vol — wait for dip to EMA50 · Stop below EMA50 · Target EMA200"
                 else:  # C
@@ -905,14 +918,6 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
                 play = "▶ Golden cross just formed — buy near EMA50 support · Stop below EMA200 · Hold for trend"
             else:  # PULLBACK
                 play = "▶ Second-chance entry — buy dip to EMA50 · Stop 3% below EMA50 · Target prior high"
-
-            now_price = _live_price(sym, exch)
-            if now_price and close:
-                chg     = (now_price - close) / close * 100
-                chg_str = f"{chg:+.1f}%"
-                now_line = f"Now  {_efmt(now_price)} ({chg_str})"
-            else:
-                now_line = None
 
             entry = [
                 headline,
