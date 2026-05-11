@@ -388,19 +388,42 @@ def update_outcomes():
             trough  = current
             changed = True
 
+        sig_em  = {"FRESH_CROSS": "🌟", "COIL": "💥", "REVERSAL": "⚡", "PULLBACK": "🔁"}.get(rec.get("signal", ""), "📊")
+        day_n   = int(age_d) + 1
+
         # Check target hit (via peak — catches intra-period highs)
         target = rec.get("target_price")
         if target and not rec.get("target_hit") and peak >= target:
             rec["target_hit"]     = True
-            rec["target_hit_day"] = int(age_d) + 1
+            rec["target_hit_day"] = day_n
             changed = True
+            send_telegram(
+                f"{'─' * 22}\n"
+                f"🎯 TARGET HIT — {rec['symbol']}\n"
+                f"{'─' * 22}\n"
+                f"[{sig_em} {rec.get('signal','')} · {rec.get('exchange','')}]\n"
+                f"Entry  {_efmt(entry)}\n"
+                f"Target {_efmt(target)}  ← hit\n"
+                f"Peak   {_efmt(peak)}  ({(peak - entry) / entry * 100:+.1f}%)\n"
+                f"Day {day_n} of tracking"
+            )
 
         # Check stop hit (via trough)
         stop = rec.get("stop_price")
         if stop and not rec.get("stop_hit") and trough <= stop:
             rec["stop_hit"]     = True
-            rec["stop_hit_day"] = int(age_d) + 1
+            rec["stop_hit_day"] = day_n
             changed = True
+            send_telegram(
+                f"{'─' * 22}\n"
+                f"🛑 STOP HIT — {rec['symbol']}\n"
+                f"{'─' * 22}\n"
+                f"[{sig_em} {rec.get('signal','')} · {rec.get('exchange','')}]\n"
+                f"Entry  {_efmt(entry)}\n"
+                f"Stop   {_efmt(stop)}  ← hit\n"
+                f"Trough {_efmt(trough)}  ({(trough - entry) / entry * 100:+.1f}%)\n"
+                f"Day {day_n} of tracking"
+            )
 
         # Fill point-in-time milestones
         if age_d >= 1  and rec.get("d1")  is None:
