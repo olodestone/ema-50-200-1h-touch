@@ -272,14 +272,29 @@ def record_outcome(sig: dict):
     ema50    = sig.get("ema50") or 0
     ema200   = sig.get("ema200") or 0
 
-    # Target: fill the EMA gap for COIL/REVERSAL/FRESH_CROSS; prior high for PULLBACK
+    # Target: fill the EMA gap for COIL/REVERSAL/FRESH_CROSS; prior high for PULLBACK.
+    # Fallback targets when ema200 <= entry (common: FRESH_CROSS by definition puts EMA200
+    # below close; COIL/REVERSAL path B can overshoot EMA200 on the explosive candle).
     if signal in ("REVERSAL", "FRESH_CROSS", "COIL"):
-        target_price = ema200 if ema200 > entry else None
+        if ema200 > entry:
+            target_price = ema200
+        elif signal == "FRESH_CROSS":
+            target_price = entry * 1.15       # 15% measured continuation target
+        elif signal == "COIL":
+            range_pct    = sig.get("range_pct", 20)
+            target_price = entry * (1 + range_pct / 100)  # projected coil-range move
+        else:  # REVERSAL path B — close already past EMA200
+            target_price = entry * 1.20
     else:  # PULLBACK
         peak_pct     = sig.get("peak_pct", 15)
         target_price = ema50 * (1 + peak_pct / 100) if ema50 else None
 
-    stop_price = ema50 * 0.97 if ema50 else None
+    # FRESH_CROSS: EMA50 ≈ EMA200 post-cross; stop 3% below EMA200 is the real
+    # invalidation level (EMA50 × 0.97 would go through EMA200).
+    if signal == "FRESH_CROSS":
+        stop_price = ema200 * 0.97 if ema200 else None
+    else:
+        stop_price = ema50 * 0.97 if ema50 else None
 
     outcomes.append({
         "id":             entry_id,

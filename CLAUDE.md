@@ -2,7 +2,7 @@
 
 Lightweight watchlist alert bot. No trading. No DB.
 Two modes: manual watchlist (any EMA touch) + auto-screener (trending coins, pullback alerts only).
-Deployed on Heroku as a worker process. KuCoin spot.
+Deployed on Railway as a worker process. KuCoin spot.
 
 ---
 
@@ -182,7 +182,7 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-**Deployment:** Heroku worker dyno (`Procfile`: `worker: python bot.py`), Python 3.10.
+**Deployment:** Railway worker (`Procfile`: `worker: python bot.py`), Python 3.10.
 
 ---
 

@@ -42,7 +42,7 @@ COIL_EMA_GAP_PCT        = 0.20  # COIL: EMA50/EMA200 gap must be < 20%
 FRESH_CROSS_1H_LOOKBACK = 72    # FRESH_CROSS: look back this many 1h candles (= 3 days)
 PULL_PEAK_MIN_PCT       = 0.15  # PULLBACK: prior run above EMA50 must be ≥ 15%
 PULL_MAX_DIST_PCT       = 0.05  # PULLBACK: close must be within 5% above EMA50
-PULL_LOOKBACK           = 10    # PULLBACK: days to look back for prior peak
+PULL_LOOKBACK           = 25    # PULLBACK: days to look back for prior peak (was 10 — too short, missed pullbacks 11-25 days after the surge)
 PULL_CROSS_WINDOW       = 90    # PULLBACK: golden cross must be within 90 days (was 35 — too short, excluded valid setups after 5-week runs)
 
 REV_VOL_MULT         = 4.0   # REVERSAL path A: explosive volume (RAVE/ENJ)
@@ -52,7 +52,7 @@ REV_B_VOL_MULT       = 1.2   # REVERSAL path B: moderate volume (BNRENSHENGUSDT)
 REV_B_MIN_DAILY_PCT  = 20.0  # REVERSAL path B: single-day move ≥ 20%
 REV_B_EMA50_BREAK    = 0.20  # REVERSAL path B: close ≥ 20% above EMA50
 REV_C_VOL_MULT       = 10.0  # REVERSAL path C: massive volume alone (vol explosion)
-REV_BASE_WINDOW      = 5     # REVERSAL: avg of last N closes must be near/below EMA50
+REV_BASE_WINDOW      = 10    # REVERSAL: avg of last N closes must be near/below EMA50 (was 5 — too short, a brief dip could qualify)
 
 EXCLUDED = {
     "USDC/USDT", "TUSD/USDT", "BUSD/USDT", "DAI/USDT",
@@ -229,6 +229,8 @@ def check_reversal(df: pd.DataFrame, sym: str, exch: str) -> dict | None:
     explosive_mid = (hi + lo) / 2
     if confirm["close"] < explosive_mid:
         return None
+    if confirm["volume"] < vol_ma * 0.3:
+        return None
 
     base_window = df.iloc[-(REV_BASE_WINDOW + 3):-3]
     if len(base_window) < REV_BASE_WINDOW:
@@ -263,8 +265,14 @@ def check_pullback(df: pd.DataFrame, sym: str, exch: str) -> dict | None:
     close  = last["close"]
     ema50  = last["ema50"]
     ema200 = last["ema200"]
+    vol    = last["volume"]
+    vol_ma = last["vol_ma"]
 
     if any(pd.isna(x) for x in [close, ema50, ema200]):
+        return None
+    if pd.isna(vol_ma) or vol_ma == 0:
+        return None
+    if vol < vol_ma * 0.3:
         return None
     if ema50 <= ema200:
         return None
