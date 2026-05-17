@@ -8,14 +8,17 @@ Two watchlists:
 """
 
 import os
+import sys
+import gc
 import json
 import time
-import ccxt
-import pandas as pd
+import subprocess
+import tempfile
+import requests
 from datetime import datetime, timedelta
 from logger import send_telegram, get_updates
-from screener import scan_trending_coins
-from explosive_screener import scan_explosive_setups
+
+_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ─── Config ────────────────────────────────────────────────────────────────
 WATCHLIST_FILE         = "watchlist.json"
@@ -60,48 +63,152 @@ PULLBACK_WATCH_EXPIRY_DAYS = 7             # auto-expire entries older than this
 TOKEN   = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# ─── Exchanges ──────────────────────────────────────────────────────────────
-exchange = ccxt.kucoin({
-    "apiKey":    os.getenv("KUCOIN_API_KEY",    ""),
-    "secret":    os.getenv("KUCOIN_SECRET",     ""),
-    "password":  os.getenv("KUCOIN_PASSWORD",   ""),
-    "enableRateLimit": True,
-})
+# ─── HTTP helpers (strategy 2: no ccxt in main process) ─────────────────────
+# KuCoin candles: newest-first, [time_s, open, close, high, low, volume, amount]
+def _fetch_kucoin_ohlcv(symbol: str, limit: int = 220) -> list | None:
+    """Returns [[ts_ms, open, high, low, close, volume], ...] oldest-first or None."""
+    kc_sym = symbol.replace("/", "-")
+    try:
+        resp = requests.get(
+            "https://api.kucoin.com/api/v1/market/candles",
+            params={"symbol": kc_sym, "type": "1hour"},
+            timeout=15,
+        )
+        data = resp.json()
+        if data.get("code") != "200000" or not data.get("data"):
+            return None
+        rows = [
+            [int(c[0]) * 1000, float(c[1]), float(c[3]), float(c[4]), float(c[2]), float(c[5])]
+            for c in reversed(data["data"])
+        ]
+        return rows[-limit:]
+    except Exception as e:
+        print(f"  kucoin ohlcv {symbol}: {e}")
+        return None
 
-try:
-    mexc_exchange = ccxt.mexc({
-        "enableRateLimit": True,
-        "options": {"defaultType": "spot"},
-    })
-except Exception as _mexc_err:
-    print(f"MEXC spot init failed: {_mexc_err}")
-    mexc_exchange = None
 
-try:
-    mexc_swap_exchange = ccxt.mexc({
-        "enableRateLimit": True,
-        "options": {"defaultType": "swap"},
-    })
-except Exception as _mexc_swap_err:
-    print(f"MEXC swap init failed: {_mexc_swap_err}")
-    mexc_swap_exchange = None
+def _fetch_ohlcv_http(symbol: str, exch_name: str, limit: int = 220) -> list | None:
+    """Multi-exchange OHLCV via REST. Returns [[ts_ms, open, high, low, close, vol], ...] oldest-first."""
+    try:
+        if exch_name == "KuCoin":
+            return _fetch_kucoin_ohlcv(symbol, limit)
 
-try:
-    binance_exchange = ccxt.binance({
-        "enableRateLimit": True,
-        "options": {"defaultType": "spot"},
-    })
-except Exception as _binance_err:
-    print(f"Binance init failed: {_binance_err}")
-    binance_exchange = None
+        elif exch_name in ("MEXC", "MEXC-swap"):
+            base = symbol.split("/")[0]
+            resp = requests.get(
+                "https://api.mexc.com/api/v3/klines",
+                params={"symbol": base + "USDT", "interval": "1h", "limit": limit},
+                timeout=15,
+            )
+            raw = resp.json()
+            return [[int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])]
+                    for c in raw if isinstance(c, list)]
 
-try:
-    gate_exchange = ccxt.gateio({
-        "enableRateLimit": True,
-    })
-except Exception as _gate_err:
-    print(f"Gate.io init failed: {_gate_err}")
-    gate_exchange = None
+        elif exch_name == "Binance":
+            sym = symbol.replace("/USDT", "USDT")
+            resp = requests.get(
+                "https://api.binance.com/api/v3/klines",
+                params={"symbol": sym, "interval": "1h", "limit": limit},
+                timeout=15,
+            )
+            raw = resp.json()
+            return [[int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])]
+                    for c in raw if isinstance(c, list)]
+
+        elif exch_name == "Gate.io":
+            # Gate.io v4: [time_s, base_vol, close, high, low, open, ...]
+            sym = symbol.replace("/USDT", "_USDT")
+            resp = requests.get(
+                "https://api.gateio.ws/api/v4/spot/candlesticks",
+                params={"currency_pair": sym, "interval": "1h", "limit": limit},
+                timeout=15,
+            )
+            raw = resp.json()
+            return [[int(c[0]) * 1000, float(c[5]), float(c[3]), float(c[4]), float(c[2]), float(c[1])]
+                    for c in raw if isinstance(c, list)]
+    except Exception as e:
+        print(f"  ohlcv_http {symbol} [{exch_name}]: {e}")
+        return None
+
+
+def _fetch_price_http(symbol: str, exch_name: str) -> float | None:
+    """Fetch latest price for symbol on given exchange via REST. Returns None on failure."""
+    try:
+        if exch_name == "KuCoin":
+            r = requests.get(
+                "https://api.kucoin.com/api/v1/market/orderbook/level1",
+                params={"symbol": symbol.replace("/", "-")}, timeout=10,
+            )
+            d = r.json()
+            if d.get("code") == "200000" and d.get("data"):
+                return float(d["data"]["price"])
+
+        elif exch_name == "MEXC":
+            sym = symbol.replace("/USDT", "USDT")
+            r = requests.get(f"https://api.mexc.com/api/v3/ticker/price?symbol={sym}", timeout=10)
+            return float(r.json()["price"])
+
+        elif exch_name == "MEXC-swap":
+            base = symbol.split("/")[0]
+            r = requests.get(
+                f"https://contract.mexc.com/api/v1/contract/ticker?symbol={base}_USDT",
+                timeout=10,
+            )
+            return float(r.json()["data"]["lastPrice"])
+
+        elif exch_name == "Binance":
+            sym = symbol.replace("/USDT", "USDT")
+            r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={sym}", timeout=10)
+            return float(r.json()["price"])
+
+        elif exch_name == "Gate.io":
+            sym = symbol.replace("/USDT", "_USDT")
+            r = requests.get(
+                f"https://api.gateio.ws/api/v4/spot/tickers?currency_pair={sym}", timeout=10
+            )
+            data = r.json()
+            return float(data[0]["last"]) if data else None
+
+    except Exception:
+        return None
+
+
+# ─── Pure-Python EMA/median (strategy 2: no pandas in main process) ──────────
+def _ema(values: list, span: int) -> list:
+    alpha = 2.0 / (span + 1)
+    out, prev = [], None
+    for v in values:
+        prev = v if prev is None else v * alpha + prev * (1 - alpha)
+        out.append(prev)
+    return out
+
+
+def _rolling_median(values: list, window: int) -> list:
+    out = [None] * len(values)
+    for i in range(window - 1, len(values)):
+        w = sorted(values[i - window + 1 : i + 1])
+        mid = window // 2
+        out[i] = w[mid] if window % 2 else (w[mid - 1] + w[mid]) / 2.0
+    return out
+
+
+def _last_closed(rows: list, ema50s: list, ema200s: list, vol_mas: list) -> dict | None:
+    """Return candle data for iloc[-2] — the last fully closed candle."""
+    i = len(rows) - 2
+    vol_ma = vol_mas[i]
+    if vol_ma is None or vol_ma == 0:
+        return None
+    return {
+        "close":  rows[i][4], "high": rows[i][2], "low": rows[i][3],
+        "volume": rows[i][5], "vol_ma": vol_ma,
+        "ema50":  ema50s[i],  "ema200": ema200s[i],
+        "ts_ms":  rows[i][0],
+    }
+
+
+# ─── Symbol cache for verify_symbol ──────────────────────────────────────────
+_kucoin_syms: set = set()
+_kucoin_syms_ts: float = 0.0
 
 # ─── Alert cooldown state (persisted) ───────────────────────────────────────
 # key: "SYMBOL|label"  value: datetime of last alert sent
@@ -185,6 +292,26 @@ def save_alert_state(state: dict):
     """Persist last_alert to disk. Converts datetime values to ISO strings."""
     with open(ALERT_STATE_FILE, "w") as f:
         json.dump({k: v.isoformat() for k, v in state.items()}, f, indent=2)
+
+
+def _prune_alert_state_for(symbol: str):
+    """Remove last_alert cooldown entries for a symbol that just left a watchlist."""
+    prefix = f"{symbol}|"
+    stale  = [k for k in last_alert if k.startswith(prefix)]
+    for k in stale:
+        del last_alert[k]
+    if stale:
+        save_alert_state(last_alert)
+
+
+def _prune_stale_alert_state():
+    """Remove last_alert entries older than ALERT_COOLDOWN — they can't suppress anything."""
+    now   = datetime.utcnow()
+    stale = [k for k, v in last_alert.items() if (now - v) > ALERT_COOLDOWN]
+    for k in stale:
+        del last_alert[k]
+    if stale:
+        save_alert_state(last_alert)
 
 
 def load_explosive_state() -> dict:
@@ -335,17 +462,7 @@ def update_outcomes():
     """
     if not outcomes:
         return
-    now = datetime.utcnow()
-    exch_map = {"KuCoin": exchange}
-    if mexc_exchange:
-        exch_map["MEXC"] = mexc_exchange
-    if mexc_swap_exchange:
-        exch_map["MEXC-swap"] = mexc_swap_exchange
-    if binance_exchange:
-        exch_map["Binance"] = binance_exchange
-    if gate_exchange:
-        exch_map["Gate.io"] = gate_exchange
-
+    now     = datetime.utcnow()
     changed = False
     for rec in outcomes:
         if rec.get("d30") is not None:
@@ -359,16 +476,9 @@ def update_outcomes():
             continue
 
         exch_name = rec.get("exchange", "KuCoin")
-        exch      = exch_map.get(exch_name, exchange)
         sym       = rec["symbol"]
-        fetch_sym = (sym + ":USDT") if exch_name == "MEXC-swap" and not sym.endswith(":USDT") else sym
-
-        try:
-            ticker  = exch.fetch_ticker(fetch_sym)
-            current = ticker.get("last") or ticker.get("close")
-            if current is None:
-                continue
-        except Exception:
+        current   = _fetch_price_http(sym, exch_name)
+        if current is None:
             continue
 
         entry = rec.get("entry", 0)
@@ -471,31 +581,18 @@ def normalise_symbol(raw: str) -> str | None:
 
 
 def verify_symbol(symbol: str) -> bool:
-    try:
-        exchange.load_markets()
-        return symbol in exchange.markets
-    except Exception:
-        return False
-
-
-# ─── Indicator helpers ────────────────────────────────────────────────────────
-def fetch_1h_ohlcv(symbol: str) -> pd.DataFrame | None:
-    try:
-        raw = exchange.fetch_ohlcv(symbol, "1h", limit=220)
-        df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-        return df
-    except Exception as e:
-        print(f"  fetch_ohlcv error {symbol}: {e}")
-        return None
-
-
-def compute_emas(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["ema50"]  = df["close"].ewm(span=50,  adjust=False).mean()
-    df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
-    df["vol_ma"] = df["volume"].rolling(20).median()
-    return df
+    global _kucoin_syms, _kucoin_syms_ts
+    now = time.time()
+    if now - _kucoin_syms_ts > 3600 or not _kucoin_syms:
+        try:
+            r = requests.get("https://api.kucoin.com/api/v1/symbols", timeout=15)
+            d = r.json()
+            if d.get("code") == "200000":
+                _kucoin_syms    = {f"{s['baseCurrency']}/{s['quoteCurrency']}" for s in d["data"]}
+                _kucoin_syms_ts = now
+        except Exception as e:
+            print(f"verify_symbol: {e}")
+    return symbol in _kucoin_syms
 
 
 # ─── Manual watchlist: any EMA touch ─────────────────────────────────────────
@@ -504,27 +601,27 @@ def check_touch(symbol: str) -> list[dict]:
     Returns alert dicts for each EMA touched on the last *closed* 1h candle (any direction).
     Uses iloc[-2] — iloc[-1] is the still-forming candle whose high/low/close are not final.
     """
-    df = fetch_1h_ohlcv(symbol)
-    if df is None or len(df) < 205:
+    rows = _fetch_kucoin_ohlcv(symbol, limit=220)
+    if rows is None or len(rows) < 205:
         return []
 
-    df = compute_emas(df)
-    last   = df.iloc[-2]   # last closed candle
-    close  = last["close"]
-    high   = last["high"]
-    low    = last["low"]
-    vol    = last["volume"]
-    vol_ma = last["vol_ma"]
+    closes  = [r[4] for r in rows]
+    ema50s  = _ema(closes, 50)
+    ema200s = _ema(closes, 200)
+    vol_mas = _rolling_median([r[5] for r in rows], 20)
 
-    if pd.isna(vol_ma) or vol_ma == 0:
+    candle = _last_closed(rows, ema50s, ema200s, vol_mas)
+    del closes, ema50s, ema200s, vol_mas, rows
+
+    if candle is None:
         return []
 
-    good_volume = vol > vol_ma * VOLUME_MULT
+    close, high, low = candle["close"], candle["high"], candle["low"]
+    vol, vol_ma      = candle["volume"], candle["vol_ma"]
+    good_volume      = vol > vol_ma * VOLUME_MULT
 
     alerts = []
-    for label, ema_val in [("EMA50", last["ema50"]), ("EMA200", last["ema200"])]:
-        if pd.isna(ema_val):
-            continue
+    for label, ema_val in [("EMA50", candle["ema50"]), ("EMA200", candle["ema200"])]:
         candle_touched = low <= ema_val <= high
         close_near     = abs(close - ema_val) / ema_val <= TOUCH_BUFFER
         if (candle_touched or close_near) and good_volume:
@@ -553,32 +650,31 @@ def check_pullback(symbol: str, state: dict) -> tuple[list[dict], dict]:
     Returns (alerts, new_state).
     new_state includes "auto_remove": True if price is 3%+ below EMA200.
     """
-    df = fetch_1h_ohlcv(symbol)
-    if df is None or len(df) < 205:
+    rows = _fetch_kucoin_ohlcv(symbol, limit=220)
+    if rows is None or len(rows) < 205:
         return [], state
 
-    df = compute_emas(df)
-    last   = df.iloc[-2]   # last closed candle — high/low/close are final
-    close  = last["close"]
-    high   = last["high"]
-    low    = last["low"]
-    vol    = last["volume"]
-    vol_ma = last["vol_ma"]
-    ema50  = last["ema50"]
-    ema200 = last["ema200"]
+    closes  = [r[4] for r in rows]
+    ema50s  = _ema(closes, 50)
+    ema200s = _ema(closes, 200)
+    vol_mas = _rolling_median([r[5] for r in rows], 20)
 
-    if pd.isna(vol_ma) or vol_ma == 0 or pd.isna(ema50) or pd.isna(ema200):
+    candle = _last_closed(rows, ema50s, ema200s, vol_mas)
+    del closes, ema50s, ema200s, vol_mas, rows
+
+    if candle is None:
         return [], state
+
+    close, high, low = candle["close"], candle["high"], candle["low"]
+    vol, vol_ma      = candle["volume"], candle["vol_ma"]
+    ema50, ema200    = candle["ema50"], candle["ema200"]
 
     good_volume   = vol > vol_ma * PULLBACK_VOLUME_MULT
     now_above_50  = close > ema50
     now_above_200 = close > ema200
+    was_above_50  = state.get("above_ema50", True)
 
-    # Default True: coin was above EMA50 when added by screener
-    was_above_50  = state.get("above_ema50",  True)
-
-    # Fresh golden cross context — passed through to the alert
-    cross_ts_str  = state.get("cross_ts")
+    cross_ts_str   = state.get("cross_ts")
     is_fresh_cross = False
     if cross_ts_str:
         try:
@@ -587,52 +683,45 @@ def check_pullback(symbol: str, state: dict) -> tuple[list[dict], dict]:
         except Exception:
             pass
 
-    # Wider touch buffer right after a golden cross — EMA50/200 are close together
-    # and price may dip slightly below EMA50 before bouncing
-    touch_buf = FRESH_CROSS_TOUCH_BUFFER if is_fresh_cross else TOUCH_BUFFER
-
-    vol_ratio = round(vol / vol_ma, 2) if vol_ma else 0
+    touch_buf  = FRESH_CROSS_TOUCH_BUFFER if is_fresh_cross else TOUCH_BUFFER
+    vol_ratio  = round(vol / vol_ma, 2) if vol_ma else 0
     ema50_dist = round((close - ema50) / ema50 * 100, 2)
     print(f"    {symbol} | close={close:.6g} low={low:.6g} EMA50={ema50:.6g} dist={ema50_dist:+.2f}% vol={vol_ratio}×avg was_above={was_above_50} good_vol={good_volume} fresh_cross={is_fresh_cross}")
 
     alerts = []
 
-    # EMA50 pullback: was above, now candle touches EMA50
     if was_above_50:
         candle_touched = low <= ema50 <= high
         close_near     = abs(close - ema50) / ema50 <= touch_buf
         if (candle_touched or close_near) and good_volume:
             alerts.append({
-                "symbol":        symbol,
-                "ema_label":     "EMA50",
-                "ema_value":     round(ema50, 6),
-                "close":         round(close, 6),
-                "volume":        round(vol, 2),
-                "vol_ma":        round(vol_ma, 2),
-                "alert_type":    "pullback",
+                "symbol":         symbol,
+                "ema_label":      "EMA50",
+                "ema_value":      round(ema50, 6),
+                "close":          round(close, 6),
+                "volume":         round(vol, 2),
+                "vol_ma":         round(vol_ma, 2),
+                "alert_type":     "pullback",
                 "is_fresh_cross": is_fresh_cross,
-                "cross_ts":      cross_ts_str,
+                "cross_ts":       cross_ts_str,
             })
 
-    # EMA200 breakdown touch: was above EMA50, now below EMA50, touching EMA200
     if was_above_50 and not now_above_50:
         candle_touched = low <= ema200 <= high
         close_near     = abs(close - ema200) / ema200 <= TOUCH_BUFFER
         if (candle_touched or close_near) and good_volume:
             alerts.append({
-                "symbol":        symbol,
-                "ema_label":     "EMA200",
-                "ema_value":     round(ema200, 6),
-                "close":         round(close, 6),
-                "volume":        round(vol, 2),
-                "vol_ma":        round(vol_ma, 2),
-                "alert_type":    "breakdown",
+                "symbol":         symbol,
+                "ema_label":      "EMA200",
+                "ema_value":      round(ema200, 6),
+                "close":          round(close, 6),
+                "volume":         round(vol, 2),
+                "vol_ma":         round(vol_ma, 2),
+                "alert_type":     "breakdown",
                 "is_fresh_cross": is_fresh_cross,
-                "cross_ts":      cross_ts_str,
+                "cross_ts":       cross_ts_str,
             })
 
-    # Cast to plain Python bool — numpy.bool_ is not JSON-serialisable
-    # Preserve cross_ts / entry_reason so fresh-cross tracking survives restarts
     new_state = {
         "above_ema50":  bool(now_above_50),
         "above_ema200": bool(now_above_200),
@@ -756,42 +845,31 @@ def _score_setup(r: dict) -> int:
 # ─── Pullback watch: EMA50 touch check ───────────────────────────────────────
 def check_pullback_watch_touch(symbol: str, exch_name: str) -> dict | None:
     """
-    Fetches live 1h OHLCV, computes EMA50, returns alert dict if the last
-    closed candle touched EMA50. No volume gate — we're specifically waiting
+    Fetches live 1h OHLCV via REST, computes EMA50, returns alert dict if the
+    last closed candle touched EMA50. No volume gate — we're specifically waiting
     for this level.
     """
-    exch_obj = (
-        {"KuCoin": exchange, "Gate.io": gate_exchange,
-         "Binance": binance_exchange, "MEXC": mexc_exchange}
-        .get(exch_name, exchange)
-    )
-    if exch_obj is None:
-        exch_obj = exchange
-    try:
-        raw = exch_obj.fetch_ohlcv(symbol, "1h", limit=220)
-        df  = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    except Exception as e:
-        print(f"  pullback_watch fetch error {symbol}: {e}")
+    rows = _fetch_ohlcv_http(symbol, exch_name, limit=220)
+    if rows is None or len(rows) < 55:
         return None
 
-    df = compute_emas(df)
-    if len(df) < 55:
-        return None
-    last  = df.iloc[-2]
-    close = last["close"]
-    high  = last["high"]
-    low   = last["low"]
-    ema50 = last["ema50"]
-    if pd.isna(ema50) or pd.isna(close):
-        return None
+    closes = [r[4] for r in rows]
+    ema50s = _ema(closes, 50)
+
+    i     = len(rows) - 2
+    close = closes[i]
+    high  = rows[i][2]
+    low   = rows[i][3]
+    ema50 = ema50s[i]
+    ts_ms = rows[i][0]
+    del closes, ema50s, rows
 
     candle_touched = low <= ema50 <= high
     close_near     = abs(close - ema50) / ema50 <= TOUCH_BUFFER
     if not (candle_touched or close_near):
         return None
 
-    candle_ts = last["ts"].strftime("%H:%M UTC") if hasattr(last["ts"], "strftime") else ""
+    candle_ts = datetime.utcfromtimestamp(ts_ms / 1000).strftime("%H:%M UTC")
     return {
         "symbol":    symbol,
         "ema50":     round(ema50, 8),
@@ -1000,22 +1078,7 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
                 seen_key.add(k)
                 unique_rows.append(r)
 
-        # Build exchange map for live price fetches
-        _best_exch_map = {"KuCoin": exchange}
-        if gate_exchange:
-            _best_exch_map["Gate.io"] = gate_exchange
-        if binance_exchange:
-            _best_exch_map["Binance"] = binance_exchange
-        if mexc_exchange:
-            _best_exch_map["MEXC"] = mexc_exchange
-
-        def _live_price(sym: str, exch_name: str) -> float | None:
-            try:
-                ex = _best_exch_map.get(exch_name, exchange)
-                t  = ex.fetch_ticker(sym)
-                return float(t["last"])
-            except Exception:
-                return None
+        _live_price = _fetch_price_http
 
         now_str = datetime.utcnow().strftime("%d %b · %H:%M UTC")
         sep     = "─" * 22
@@ -1281,6 +1344,7 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
         if sym in watchlist:
             watchlist.remove(sym)
             save_watchlist(watchlist)
+            _prune_alert_state_for(sym)
             return f"Removed {sym} from manual watchlist."
         return f"{sym} is not in the manual watchlist."
 
@@ -1293,6 +1357,7 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
         if sym in auto_watchlist:
             auto_watchlist.remove(sym)
             save_auto_watchlist(auto_watchlist)
+            _prune_alert_state_for(sym)
             return f"Removed {sym} from auto-screener list."
         return f"{sym} is not in the auto-screener list."
 
@@ -1320,10 +1385,20 @@ def handle_command(text: str, watchlist: list, auto_watchlist: list) -> str | No
 
 # ─── Screener run ─────────────────────────────────────────────────────────────
 def run_screener(auto_watchlist: list, price_state: dict):
-    """Runs the screener, adds new trending coins, notifies via Telegram."""
-    print(f"[{datetime.utcnow().strftime('%H:%M')}] Running auto-screener...")
+    """Runs the screener in a subprocess (ccxt+pandas freed on exit), adds new coins."""
+    print(f"[{datetime.utcnow().strftime('%H:%M')}] Running auto-screener (subprocess)...")
+    tmp_path = None
     try:
-        found     = scan_trending_coins(exchange)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
+            tmp_path = tf.name
+        subprocess.run(
+            [sys.executable, os.path.join(_DIR, "screener_worker.py"), tmp_path],
+            timeout=300, check=True,
+        )
+        with open(tmp_path) as f:
+            found = json.load(f)
+        os.unlink(tmp_path)
+        tmp_path = None
         new_items = [c for c in found if c["symbol"] not in auto_watchlist]
         for item in new_items:
             s = item["symbol"]
@@ -1423,8 +1498,16 @@ def run_screener(auto_watchlist: list, price_state: dict):
             send_telegram(
                 f"🔍 Screener complete — {len(auto_watchlist)} pair(s) in auto-list, no new additions."
             )
+    except subprocess.TimeoutExpired:
+        print("Screener subprocess timed out (5 min)")
     except Exception as e:
         print(f"Screener error: {e}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 # ─── Explosive daily alert formatting ────────────────────────────────────────
@@ -1450,7 +1533,7 @@ def send_explosive_alert(sig: dict):
         cross_line = ""
         if cross_ts:
             try:
-                dt = pd.Timestamp(cross_ts)
+                dt = datetime.fromisoformat(cross_ts.replace("Z", "+00:00")).replace(tzinfo=None)
                 cross_line = f"\nCrossed {dt.strftime('%d %b %H:%M')} UTC (1h)"
             except Exception:
                 pass
@@ -1588,19 +1671,23 @@ def _send_fresh_cross_batch(sigs: list[dict]):
 
 
 def run_explosive_scan(expl_state: dict):
-    """Run the explosive setup scan and fire Telegram alerts."""
-    print(f"[{datetime.utcnow().strftime('%H:%M')}] Running explosive scan...")
-    # Prune cooldown entries that have already expired — prevents unbounded dict growth
-    max_cd  = max(EXPLOSIVE_COOLDOWNS.values())
-    cutoff  = datetime.utcnow() - max_cd - timedelta(days=1)
+    """Run the explosive setup scan in a subprocess (ccxt+pandas freed on exit)."""
+    print(f"[{datetime.utcnow().strftime('%H:%M')}] Running explosive scan (subprocess)...")
+    max_cd = max(EXPLOSIVE_COOLDOWNS.values())
+    cutoff = datetime.utcnow() - max_cd - timedelta(days=1)
     expl_state["alerts"] = {k: v for k, v in expl_state["alerts"].items() if v > cutoff}
+    tmp_path = None
     try:
-        setups = scan_explosive_setups(
-            exchange, mexc_exchange,
-            mexc_swap=mexc_swap_exchange,
-            binance=binance_exchange,
-            gate=gate_exchange,
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
+            tmp_path = tf.name
+        subprocess.run(
+            [sys.executable, os.path.join(_DIR, "explosive_worker.py"), tmp_path],
+            timeout=600, check=True,
         )
+        with open(tmp_path) as f:
+            setups = json.load(f)
+        os.unlink(tmp_path)
+        tmp_path = None
         if not setups:
             print("  [explosive] No setups found.")
             save_explosive_state(expl_state)
@@ -1649,8 +1736,18 @@ def run_explosive_scan(expl_state: dict):
 
         save_explosive_state(expl_state)
         print(f"  [explosive] {fired} alert(s) fired.")
+    except subprocess.TimeoutExpired:
+        print("[explosive] Subprocess timed out (10 min)")
+        save_explosive_state(expl_state)
     except Exception as e:
         print(f"[explosive] Scan error: {e}")
+        save_explosive_state(expl_state)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
         save_explosive_state(expl_state)
 
 
@@ -1721,6 +1818,7 @@ def run():
             last_scan_ts = now
             run_screener(auto_watchlist, price_state)
             update_outcomes()
+            _prune_stale_alert_state()
 
         # ── Explosive scan: 3× daily at 00:30 / 08:30 / 16:30 UTC ──────────
         today_str = now_utc.strftime("%Y-%m-%d")
@@ -1748,7 +1846,7 @@ def run():
             # Manual watchlist — alert on any touch
             if watchlist:
                 print(f"[{ts_str}] Checking {len(watchlist)} manual pair(s)...")
-                for symbol in list(watchlist):
+                for _idx, symbol in enumerate(list(watchlist)):
                     try:
                         alerts = check_touch(symbol)
                         for alert in alerts:
@@ -1765,20 +1863,23 @@ def run():
                             print(f"  {symbol} — no touch")
                     except Exception as e:
                         print(f"  {symbol} check error: {e}")
+                    finally:
+                        if _idx % 10 == 9:
+                            gc.collect()
                     time.sleep(1.0)
+                gc.collect()
 
             # Auto-watchlist — pullback / breakdown alerts only
             if auto_watchlist:
                 print(f"[{ts_str}] Checking {len(auto_watchlist)} auto-screener pair(s)...")
                 to_remove = []
-                for symbol in list(auto_watchlist):
+                for _idx, symbol in enumerate(list(auto_watchlist)):
                     try:
                         state             = price_state.get(symbol, {"above_ema50": True, "above_ema200": True})
                         alerts, new_state = check_pullback(symbol, state)
                         price_state[symbol] = new_state
 
                         for alert in alerts:
-                            # "_auto" suffix keeps cooldown independent from manual watchlist
                             key  = f"{symbol}|{alert['ema_label']}_auto"
                             prev = last_alert.get(key)
                             if prev is None or (datetime.utcnow() - prev) >= ALERT_COOLDOWN:
@@ -1796,12 +1897,17 @@ def run():
                             print(f"  {symbol} — no pullback")
                     except Exception as e:
                         print(f"  {symbol} auto-check error: {e}")
+                    finally:
+                        if _idx % 10 == 9:
+                            gc.collect()
                     time.sleep(1.0)
+                gc.collect()
 
                 if to_remove:
                     for s in to_remove:
                         auto_watchlist.remove(s)
                         price_state.pop(s, None)
+                        _prune_alert_state_for(s)
                     save_auto_watchlist(auto_watchlist)
                     save_price_state(price_state)
                     send_telegram(

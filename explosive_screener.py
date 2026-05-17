@@ -26,6 +26,7 @@ Confluence flag is set when ≥2 signals agree on the same coin.
 Parallel: each exchange scanned with ThreadPoolExecutor(max_workers=8).
 """
 
+import gc
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -318,12 +319,17 @@ def _top_pairs(exchange, top_n: int = TOP_N) -> list[str]:
         if not sym.endswith("/USDT") or sym in EXCLUDED:
             continue
         base = sym.split("/")[0]
-        if _LEVERAGED_RE.search(base):   # skip 3L, 3S, 2L, 2S etc. leveraged tokens
+        if _LEVERAGED_RE.search(base):
             continue
         m = exchange.markets.get(sym, {})
         if m.get("type") not in (None, "spot"):
             continue
         pairs.append((sym, t.get("quoteVolume") or 0))
+
+    # Strategy 4: free large market/ticker caches after extraction
+    exchange.markets = {}
+    del tickers
+    gc.collect()
 
     pairs.sort(key=lambda x: x[1], reverse=True)
     return [s for s, _ in pairs[:top_n]]
@@ -349,6 +355,11 @@ def _top_swap_pairs(exchange, top_n: int = TOP_N) -> list[str]:
         if m.get("type") != "swap":
             continue
         pairs.append((sym, t.get("quoteVolume") or 0))
+
+    # Strategy 4: free large caches after extraction
+    exchange.markets = {}
+    del tickers
+    gc.collect()
 
     pairs.sort(key=lambda x: x[1], reverse=True)
     return [s for s, _ in pairs[:top_n]]
@@ -402,25 +413,29 @@ def _scan_one(sym: str, exch, exch_name: str, display_sym: str | None = None) ->
     df_d = _fetch_daily(exch, sym)
     time.sleep(0.1)
 
-    if df_1h is not None and _is_near_peg(df_1h):
-        return []
+    try:
+        if df_1h is not None and _is_near_peg(df_1h):
+            return []
 
-    signals = []
-    if df_1h is not None:
-        sig = check_fresh_cross(df_1h, show_sym, exch_name)
-        if sig:
-            signals.append(sig)
-    if df_d is not None:
-        for fn in (check_coil, check_reversal, check_pullback):
-            sig = fn(df_d, show_sym, exch_name)
+        signals = []
+        if df_1h is not None:
+            sig = check_fresh_cross(df_1h, show_sym, exch_name)
             if sig:
                 signals.append(sig)
+        if df_d is not None:
+            for fn in (check_coil, check_reversal, check_pullback):
+                sig = fn(df_d, show_sym, exch_name)
+                if sig:
+                    signals.append(sig)
 
-    if len(signals) >= 2:
-        for s in signals:
-            s["confluence"] = True
+        if len(signals) >= 2:
+            for s in signals:
+                s["confluence"] = True
 
-    return signals
+        return signals
+    finally:
+        # Strategy 3: explicit cleanup so GC can reclaim DataFrame memory promptly
+        del df_1h, df_d
 
 
 def _run_parallel(tasks: list[tuple], max_workers: int = 8) -> list[dict]:

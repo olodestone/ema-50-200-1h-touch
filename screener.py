@@ -4,6 +4,7 @@ Auto-screener: scans top KuCoin USDT pairs and returns those where
 crossed above EMA200 (golden cross) in the last 3 closed candles.
 """
 
+import gc
 import time
 import pandas as pd
 from datetime import datetime, timezone
@@ -88,12 +89,18 @@ def scan_trending_coins(exchange, top_n: int = SCREENER_TOP_N) -> list[dict]:
         quote_vol = ticker.get("quoteVolume") or 0
         usdt_pairs.append((sym, quote_vol))
 
+    # Strategy 4: free large market/ticker caches after extraction
+    exchange.markets = {}
+    del tickers
+    gc.collect()
+
     usdt_pairs.sort(key=lambda x: x[1], reverse=True)
     candidates = [sym for sym, _ in usdt_pairs[:top_n]]
     print(f"  Screener: checking top {len(candidates)} pairs by volume...")
 
     trending = []
-    for sym in candidates:
+    for _idx, sym in enumerate(candidates):
+        df = raw = None
         try:
             raw = exchange.fetch_ohlcv(sym, "1h", limit=336)  # 336 = 14 days; EMA200 needs 200
             if len(raw) < 60:
@@ -121,32 +128,30 @@ def scan_trending_coins(exchange, top_n: int = SCREENER_TOP_N) -> list[dict]:
             above_margin  = (close - ema50) / ema50 >= MIN_EMA50_MARGIN
             bullish_macro = ema50 > ema200
 
-            # Path A — momentum: trending with volume confirmation
-            # Scan back CROSS_INFO_WINDOW_H (14 days) for a recent golden cross.
-            # cross_ts is informational only — shown in entry/pullback alerts but
-            # does not change whether alerts fire or what thresholds apply.
             if above_margin and bullish_macro and vol > vol_ma * AUTO_VOLUME_MULT:
                 _, cross_ts = detect_golden_cross(df, lookback=CROSS_INFO_WINDOW_H)
-                trending.append({"symbol": sym, "close": close, "ema50": ema50,
-                                 "ema200": ema200, "pct": pct, "vol_ratio": vol_ratio,
+                trending.append({"symbol": sym, "close": float(close), "ema50": float(ema50),
+                                 "ema200": float(ema200), "pct": float(pct), "vol_ratio": float(vol_ratio),
                                  "entry_reason": "momentum", "cross_ts": cross_ts})
                 cross_note = f" | cross {cross_ts}" if cross_ts is not None else ""
                 print(f"    ✓ {sym} — momentum (close {close:.6g} > EMA50 {ema50:.6g} > EMA200 {ema200:.6g}, +{pct:.2f}%{cross_note})")
 
-            # Path B — golden cross: EMA50 just crossed above EMA200 (no vol/margin gate)
             elif bullish_macro:
                 just_crossed, cross_ts = detect_golden_cross(df)
                 if just_crossed:
-                    trending.append({"symbol": sym, "close": close, "ema50": ema50,
-                                     "ema200": ema200, "pct": pct, "vol_ratio": vol_ratio,
-                                     "entry_reason": "golden_cross",
-                                     "cross_ts": cross_ts})
+                    trending.append({"symbol": sym, "close": float(close), "ema50": float(ema50),
+                                     "ema200": float(ema200), "pct": float(pct), "vol_ratio": float(vol_ratio),
+                                     "entry_reason": "golden_cross", "cross_ts": cross_ts})
                     print(f"    🌟 {sym} — golden cross (EMA50 {ema50:.6g} crossed above EMA200 {ema200:.6g} @ {cross_ts})")
 
-            time.sleep(0.5)  # rate limiting — 0.3s was hitting KuCoin 429s
+            time.sleep(0.5)
         except Exception as e:
             print(f"  Screener {sym}: {e}")
-            continue
+        finally:
+            # Strategy 3: explicit cleanup every iteration
+            del df, raw
+            if _idx % 20 == 19:
+                gc.collect()
 
     print(f"  Screener: {len(trending)} trending pair(s) found.")
     return trending
